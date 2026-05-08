@@ -1,0 +1,148 @@
+# Gateforge-Loom — multi-agent orchestration stack
+# Brain (Claude Gateway) + Hands (OpenClaw) + Memory (Hermes)
+# + Redis state bus + Postgres/pgvector + n8n orchestrator
+# Add new agents by appending a service block + a node in the n8n workflow.
+
+name: gateforge-loom
+
+x-healthcheck-defaults: &healthcheck-defaults
+  interval: 10s
+  timeout: 5s
+  retries: 5
+  start_period: 5s
+
+services:
+  # ---------------- Storage ----------------
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: gfl-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    ports:
+      - "${POSTGRES_PORT}:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./infra/postgres/init.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
+    healthcheck:
+      <<: *healthcheck-defaults
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+    networks: [loomnet]
+
+  redis:
+    image: redis:7-alpine
+    container_name: gfl-redis
+    restart: unless-stopped
+    command: ["redis-server", "--requirepass", "${REDIS_PASSWORD}", "--appendonly", "yes"]
+    ports:
+      - "${REDIS_PORT}:6379"
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      <<: *healthcheck-defaults
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD}", "ping"]
+    networks: [loomnet]
+
+  # ---------------- Brain ----------------
+  claude-gateway:
+    build:
+      context: ./services/claude-gateway
+    container_name: gfl-claude-gateway
+    restart: unless-stopped
+    environment:
+      LOG_LEVEL: ${LOG_LEVEL}
+      INTERNAL_API_TOKEN: ${INTERNAL_API_TOKEN}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
+      CLAUDE_MODEL: ${CLAUDE_MODEL}
+      STUB_MODE: ${STUB_MODE}
+      REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379/0
+    ports:
+      - "${CLAUDE_GATEWAY_PORT}:8000"
+    depends_on:
+      redis:
+        condition: service_healthy
+    healthcheck:
+      <<: *healthcheck-defaults
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/health').status==200 else 1)"]
+    networks: [loomnet]
+
+  # ---------------- Hands ----------------
+  openclaw:
+    build:
+      context: ./services/openclaw
+    container_name: gfl-openclaw
+    restart: unless-stopped
+    environment:
+      LOG_LEVEL: ${LOG_LEVEL}
+      INTERNAL_API_TOKEN: ${INTERNAL_API_TOKEN}
+      STUB_MODE: ${STUB_MODE}
+      REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379/0
+    ports:
+      - "${OPENCLAW_PORT}:8000"
+    depends_on:
+      redis:
+        condition: service_healthy
+    healthcheck:
+      <<: *healthcheck-defaults
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/health').status==200 else 1)"]
+    networks: [loomnet]
+
+  # ---------------- Memory ----------------
+  hermes:
+    build:
+      context: ./services/hermes
+    container_name: gfl-hermes
+    restart: unless-stopped
+    environment:
+      LOG_LEVEL: ${LOG_LEVEL}
+      INTERNAL_API_TOKEN: ${INTERNAL_API_TOKEN}
+      STUB_MODE: ${STUB_MODE}
+      DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+    ports:
+      - "${HERMES_PORT}:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      <<: *healthcheck-defaults
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/health').status==200 else 1)"]
+    networks: [loomnet]
+
+  # ---------------- Orchestrator ----------------
+  n8n:
+    image: n8nio/n8n:latest
+    container_name: gfl-n8n
+    restart: unless-stopped
+    environment:
+      N8N_BASIC_AUTH_ACTIVE: ${N8N_BASIC_AUTH_ACTIVE}
+      N8N_BASIC_AUTH_USER: ${N8N_BASIC_AUTH_USER}
+      N8N_BASIC_AUTH_PASSWORD: ${N8N_BASIC_AUTH_PASSWORD}
+      N8N_HOST: ${N8N_HOST}
+      N8N_PORT: 5678
+      N8N_PROTOCOL: http
+      N8N_ENCRYPTION_KEY: ${N8N_ENCRYPTION_KEY}
+      WEBHOOK_URL: http://localhost:${N8N_PORT}/
+      GENERIC_TIMEZONE: Asia/Hong_Kong
+      # Allow internal HTTP calls to other services
+      N8N_SECURE_COOKIE: "false"
+    ports:
+      - "${N8N_PORT}:5678"
+    volumes:
+      - n8n-data:/home/node/.n8n
+      - ./n8n/workflows:/workflows:ro
+    depends_on:
+      - claude-gateway
+      - openclaw
+      - hermes
+    networks: [loomnet]
+
+networks:
+  loomnet:
+    driver: bridge
+
+volumes:
+  postgres-data:
+  redis-data:
+  n8n-data:

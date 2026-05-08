@@ -1,0 +1,178 @@
+{
+  "name": "Gateforge-Loom Pipeline (PoC)",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "three-agent",
+        "responseMode": "lastNode",
+        "options": {}
+      },
+      "id": "trigger",
+      "name": "Webhook Trigger",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [240, 300]
+    },
+    {
+      "parameters": {
+        "jsCode": "const id = `job_${new Date().toISOString().replace(/[-:T.Z]/g,'').slice(0,14)}_${Math.random().toString(36).slice(2,8)}`;\nreturn [{ json: { job_id: id, user_intent: $json.body?.user_intent || 'demo task', context: $json.body?.context || {} } }];"
+      },
+      "id": "make-job-id",
+      "name": "Generate job_id",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [460, 300]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://claude-gateway:8000/plan",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "Content-Type", "value": "application/json" }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ job_id: $json.job_id, user_intent: $json.user_intent, context: $json.context }) }}",
+        "options": {}
+      },
+      "id": "claude-plan",
+      "name": "Claude /plan",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [680, 300]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://hermes:8000/recall",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "Content-Type", "value": "application/json" }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ job_id: $('Generate job_id').first().json.job_id, query: $('Generate job_id').first().json.user_intent, kinds: ['sop','episodic'], top_k: 5 }) }}",
+        "options": {}
+      },
+      "id": "hermes-recall",
+      "name": "Hermes /recall",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [900, 300]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://claude-gateway:8000/merge",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "Content-Type", "value": "application/json" }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ job_id: $('Generate job_id').first().json.job_id, draft_plan: $('Claude /plan').first().json, memory_hits: $('Hermes /recall').first().json.hits || [] }) }}",
+        "options": {}
+      },
+      "id": "claude-merge",
+      "name": "Claude /merge",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1120, 300]
+    },
+    {
+      "parameters": {
+        "fieldToSplitOut": "steps",
+        "include": "noOtherFields",
+        "options": {}
+      },
+      "id": "split-steps",
+      "name": "Split steps",
+      "type": "n8n-nodes-base.splitOut",
+      "typeVersion": 1,
+      "position": [1340, 300]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://openclaw:8000/execute",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "Content-Type", "value": "application/json" }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ job_id: $('Generate job_id').first().json.job_id, step_id: $json.step_id, tool: $json.tool, input: $json.input, timeout_sec: $json.timeout_sec || 60 }) }}",
+        "options": {}
+      },
+      "id": "openclaw-execute",
+      "name": "OpenClaw /execute",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1560, 300]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://hermes:8000/write",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "Content-Type", "value": "application/json" }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ job_id: $('Generate job_id').first().json.job_id, outcome: 'success', duration_ms: 0, episode: { intent: $('Generate job_id').first().json.user_intent, plan_version: 2, step_summaries: [], lessons: ['n8n run completed'] }, sop_updates: [] }) }}",
+        "options": {}
+      },
+      "id": "hermes-write",
+      "name": "Hermes /write",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1780, 300]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://claude-gateway:8000/synthesize",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "Content-Type", "value": "application/json" }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ job_id: $('Generate job_id').first().json.job_id, step_results: [{ step_id: 's1', output: ($('OpenClaw /execute').first().json.output || {}) }], output_format: 'markdown', language: 'en' }) }}",
+        "options": {}
+      },
+      "id": "claude-synth",
+      "name": "Claude /synthesize",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [2000, 300]
+    }
+  ],
+  "connections": {
+    "Webhook Trigger": { "main": [[{ "node": "Generate job_id", "type": "main", "index": 0 }]] },
+    "Generate job_id": { "main": [[{ "node": "Claude /plan", "type": "main", "index": 0 }]] },
+    "Claude /plan": { "main": [[{ "node": "Hermes /recall", "type": "main", "index": 0 }]] },
+    "Hermes /recall": { "main": [[{ "node": "Claude /merge", "type": "main", "index": 0 }]] },
+    "Claude /merge": { "main": [[{ "node": "Split steps", "type": "main", "index": 0 }]] },
+    "Split steps": { "main": [[{ "node": "OpenClaw /execute", "type": "main", "index": 0 }]] },
+    "OpenClaw /execute": { "main": [[{ "node": "Hermes /write", "type": "main", "index": 0 }]] },
+    "Hermes /write": { "main": [[{ "node": "Claude /synthesize", "type": "main", "index": 0 }]] }
+  },
+  "settings": { "executionOrder": "v1" },
+  "tags": []
+}
