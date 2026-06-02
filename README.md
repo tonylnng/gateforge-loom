@@ -1,18 +1,26 @@
 # Gateforge-Loom
 
 > **Weave intelligent agents into workflows.**
-> A composable, multi-agent orchestration stack — every agent is its own Docker container, every interaction is a JSON contract, every run leaves a memory.
+> A composable, multi-agent orchestration stack — every agent is its own service, every interaction is a JSON contract, every run leaves a memory.
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 ![Stack](https://img.shields.io/badge/stack-FastAPI%20·%20n8n%20·%20Postgres%2Fpgvector%20·%20Redis-blue)
 ![Status](https://img.shields.io/badge/status-PoC-orange)
+![Topology](https://img.shields.io/badge/topology-3--VM%20hybrid-blueviolet)
 
 Gateforge-Loom is a **layered multi-agent system** built on three foundational
 roles — **Brain · Hands · Memory** — orchestrated by **n8n** and connected
 through **Redis** + **Postgres/pgvector**. The architecture treats agents as
 threads on a loom: today three threads, tomorrow as many as your workflow
 needs. New agents (Validator, Critic, Router, Reviewer…) drop in as additional
-containers; the orchestrator weaves them all into one cohesive run.
+services; the orchestrator weaves them all into one cohesive run.
+
+The stack runs equally well on **a single VM with Docker** or on a **3-VM
+hybrid topology** — Brain + Orchestrator in Docker on one VM, and Hands and
+Memory installed **natively as systemd services** on two more VMs, meshed over
+Tailscale. The Brain reaches Anthropic models through the **Vercel AI Gateway**,
+which keeps it reachable from regions where `api.anthropic.com` is blocked
+(e.g. Hong Kong).
 
 ---
 
@@ -24,9 +32,16 @@ containers; the orchestrator weaves them all into one cohesive run.
 - [Sequence diagram](#2-sequence-diagram-one-job-end-to-end)
 - [State diagram](#3-state-diagram-job-lifecycle)
 - [Workflow diagram](#4-workflow-diagram-the-n8n-pipeline)
+- [Deployment diagram](#5-deployment-diagram-3-vm-hybrid-topology)
+- [Install-flow diagram](#6-install-flow-diagram-cluster-bring-up)
 - [Components](#components)
 - [Quick start](#quick-start)
-- [VM deployment](#vm-deployment)
+- [Deployment topology](#deployment-topology)
+- [VM-1 install — Brain + Orchestrator (Docker)](#vm-1-install--brain--orchestrator-docker)
+- [VM-2 install — OpenClaw native (Hands)](#vm-2-install--openclaw-native-hands)
+- [VM-3 install — Hermes native (Memory)](#vm-3-install--hermes-native-memory)
+- [Backup & recovery](#backup--recovery)
+- [Operations cheatsheet](#operations-cheatsheet)
 - [Adding more agents](#adding-more-agents)
 - [Project layout](#project-layout)
 - [Roadmap](#roadmap)
@@ -42,17 +57,18 @@ execution, and memory all happen inside a single LLM call. That works for
 toys; it does not survive production. Gateforge-Loom enforces **single
 responsibility per layer**:
 
-| Layer | Container | Owns | Never does |
-|---|---|---|---|
-| **Brain** | `claude-gateway` | Decisions, plans, synthesis | Side effects, I/O |
-| **Hands** | `openclaw` | Tool execution, I/O, automation | Strategy, judgement |
-| **Memory** | `hermes` | Recall, learn, distil SOPs | Initiate actions |
-| **Bus** | `redis` | Job state, locks, cache | Long-term storage |
-| **Storage** | `postgres + pgvector` | Episodic + SOP memory | Real-time state |
-| **Orchestrator** | `n8n` | Sequencing, retries, fan-out | Anything an agent should do |
+| Layer | Service | Owns | Never does | Where it runs |
+|---|---|---|---|---|
+| **Brain** | `claude-gateway` | Decisions, plans, synthesis | Side effects, I/O | VM-1 (Docker) |
+| **Hands** | `openclaw` | Tool execution, I/O, automation | Strategy, judgement | VM-2 (native systemd) |
+| **Memory** | `hermes` | Recall, learn, distil SOPs | Initiate actions | VM-3 (native systemd) |
+| **Bus** | `redis` | Job state, locks, cache | Long-term storage | VM-1 (Docker) |
+| **Storage** | `postgres + pgvector` | Episodic + SOP memory | Real-time state | VM-3 (native) |
+| **Orchestrator** | `n8n` | Sequencing, retries, fan-out | Anything an agent should do | VM-1 (Docker) |
+| **LLM Gateway** | `Vercel AI Gateway` | HK-reachable Anthropic proxy, failover, cost tracking | Any orchestration logic | External (Vercel edge) |
 
-Each lives in its own Docker container, exposes a small typed API, and can be
-upgraded, scaled, or replaced independently.
+Each layer exposes a small typed API and can be upgraded, scaled, or replaced
+independently — whether it runs as a container or a native service.
 
 ---
 
@@ -72,13 +88,14 @@ upgraded, scaled, or replaced independently.
                       │               │               │
                       ▼               ▼               ▼
                 ┌────────────┐  ┌────────────┐  ┌────────────┐
-                │ Anthropic  │  │ Postgres + │  │  Redis bus │
-                │  (later)   │  │  pgvector  │  │   + tools  │
+                │ Vercel AI  │  │ Postgres + │  │  Redis bus │
+                │  Gateway   │  │  pgvector  │  │   + tools  │
+                │ → Anthropic│  │            │  │            │
                 └────────────┘  └────────────┘  └────────────┘
 ```
 
-Every component runs as an independent container on a single VM (or split
-across VMs over Tailscale).
+Components can all run on a single VM, or split across three VMs over
+Tailscale — see [Deployment topology](#deployment-topology).
 
 ---
 
@@ -94,21 +111,25 @@ flowchart TB
         U["User · Cron · Webhook · Chat"]
     end
 
-    subgraph Orchestration["Orchestration Layer"]
+    subgraph Orchestration["Orchestration Layer · VM-1"]
         N["n8n Workflow Engine"]
     end
 
-    subgraph Agents["Agent Layer (each container = one agent)"]
+    subgraph Agents["Agent Layer (each agent = one service)"]
         direction LR
-        B["🧠 Brain<br/><b>claude-gateway</b><br/>plan · merge · synthesize"]
-        H["✋ Hands<br/><b>openclaw</b><br/>execute · tools"]
-        M["📚 Memory<br/><b>hermes</b><br/>recall · write"]
-        F["… future agents<br/>Validator · Critic · Router"]
+        B["🧠 Brain<br/><b>claude-gateway</b><br/>VM-1 · Docker<br/>plan · merge · synthesize"]
+        H["✋ Hands<br/><b>openclaw</b><br/>VM-2 · native<br/>execute · tools"]
+        M["📚 Memory<br/><b>hermes</b><br/>VM-3 · native<br/>recall · write"]
+        FA["… future agents<br/>Validator · Critic · Router"]
+    end
+
+    subgraph External["External LLM Provider"]
+        V["☁️ Vercel AI Gateway<br/>→ Anthropic (Claude Opus)"]
     end
 
     subgraph Backplane["Shared Backplane"]
-        R[("Redis<br/>state bus")]
-        P[("Postgres + pgvector<br/>SOP + episodic")]
+        R[("Redis<br/>state bus · VM-1")]
+        P[("Postgres + pgvector<br/>SOP + episodic · VM-3")]
         S[("Object store<br/>artifacts (S3 / MinIO)")]
     end
 
@@ -120,7 +141,8 @@ flowchart TB
     N <--> B
     N <--> H
     N <--> M
-    N -.-> F
+    N -.-> FA
+    B <--> V
     B <--> R
     H <--> R
     H --> S
@@ -132,24 +154,28 @@ flowchart TB
     classDef memory  fill:#EDE9FE,stroke:#8B5CF6,color:#1F2937;
     classDef future  fill:#F3F4F6,stroke:#9CA3AF,color:#1F2937,stroke-dasharray: 5 5;
     classDef store   fill:#D1FAE5,stroke:#10B981,color:#1F2937;
+    classDef ext     fill:#FEF3C7,stroke:#F59E0B,color:#1F2937;
     class B brain
     class H hands
     class M memory
-    class F future
+    class FA future
     class R,P,S store
+    class V ext
 ```
 
 **Key idea.** Agents never call each other directly. Everything is mediated
 by n8n (control flow) and the shared backplane (state). This is what lets
-you add or remove agents without rewriting the others.
+you add or remove agents without rewriting the others. The Brain's only
+outbound dependency is the Vercel AI Gateway.
 
 ---
 
 ## 2. Sequence diagram (one job, end-to-end)
 
 What actually happens when a request comes in. Notice that **memory is
-queried before the plan is finalized**, and **memory is updated after every
-successful run** — that's how the system gets faster over time.
+queried before the plan is finalized**, **memory is updated after every
+successful run** (that's how the system gets faster over time), and **every
+Brain call round-trips through the Vercel AI Gateway** to reach Anthropic.
 
 ```mermaid
 sequenceDiagram
@@ -157,13 +183,17 @@ sequenceDiagram
     participant U as User / Trigger
     participant N as n8n
     participant C as Claude Gateway (Brain)
+    participant VG as Vercel AI Gateway
     participant M as Hermes (Memory)
     participant O as OpenClaw (Hands)
     participant DB as Postgres / Redis
 
     U->>N: POST /webhook (user_intent)
     N->>N: generate job_id
+
     N->>C: POST /plan { intent }
+    C->>VG: messages.create (Claude Opus)
+    VG-->>C: plan completion
     C-->>N: draft_plan { steps[] }
 
     N->>M: POST /recall { query }
@@ -172,6 +202,8 @@ sequenceDiagram
     M-->>N: memory_hits[]
 
     N->>C: POST /merge { draft_plan, hits }
+    C->>VG: messages.create (Claude Opus)
+    VG-->>C: merged completion
     C-->>N: final_plan (v2, SOP-augmented)
 
     loop for each step
@@ -190,6 +222,8 @@ sequenceDiagram
     M-->>N: stored
 
     N->>C: POST /synthesize { step_results }
+    C->>VG: messages.create (Claude Opus)
+    VG-->>C: synthesis completion
     C-->>N: artifact_uri + summary
 
     N-->>U: final result
@@ -247,19 +281,19 @@ Import it directly in n8n.
 
 ```mermaid
 flowchart LR
-    T([🪝 Webhook Trigger]) --> J[Generate job_id]
-    J --> P1[Claude /plan]
-    P1 --> R1[Hermes /recall]
-    R1 --> M1[Claude /merge]
-    M1 --> SP[Split steps]
-    SP --> EX[OpenClaw /execute]
-    EX --> V{Validate<br/>schema}
-    V -- retryable error --> EX
-    V -- ok --> AGG[Aggregate results]
-    AGG -- more steps --> SP
-    AGG -- done --> W[Hermes /write]
-    W --> SY[Claude /synthesize]
-    SY --> OUT([📤 Output sink])
+    T(["🪝 Webhook Trigger"]) --> J["Generate job_id"]
+    J --> P1["Claude /plan"]
+    P1 --> R1["Hermes /recall"]
+    R1 --> M1["Claude /merge"]
+    M1 --> SP["Split steps"]
+    SP --> EX["OpenClaw /execute"]
+    EX --> V{"Validate<br/>schema"}
+    V -- "retryable error" --> EX
+    V -- "ok" --> AGG["Aggregate results"]
+    AGG -- "more steps" --> SP
+    AGG -- "done" --> W["Hermes /write"]
+    W --> SY["Claude /synthesize"]
+    SY --> OUT(["📤 Output sink"])
 
     classDef trigger fill:#FECACA,stroke:#DC2626;
     classDef brain   fill:#FEE7DC,stroke:#D97757;
@@ -293,46 +327,165 @@ flowchart LR
 
 ---
 
+## 5. Deployment diagram (3-VM hybrid topology)
+
+The physical placement of every component. **VM-1** runs the Brain +
+Orchestrator + state bus in Docker; **VM-2** and **VM-3** run the agents as
+**native systemd services** (no Docker). All cross-VM traffic flows over a
+Tailscale mesh; only n8n's UI (`5678`) is public-facing.
+
+```mermaid
+flowchart TB
+    Internet(["🌐 Internet / Clients"])
+
+    subgraph VM1["VM-1 · Brain + Orchestrator · Docker"]
+        direction TB
+        N8N["n8n<br/>:5678 (public)"]
+        CG["claude-gateway<br/>:8001"]
+        RD[("redis<br/>:6379")]
+    end
+
+    subgraph VM2["VM-2 · Hands · native systemd"]
+        OC["openclaw.service<br/>:8002<br/>(uvicorn + Playwright)"]
+    end
+
+    subgraph VM3["VM-3 · Memory · native systemd"]
+        HM["hermes.service<br/>:8003 (uvicorn)"]
+        PG[("postgresql 16<br/>+ pgvector · :5432")]
+    end
+
+    VGW["☁️ Vercel AI Gateway<br/>→ Anthropic (Claude Opus)"]
+
+    Internet -->|"HTTPS :5678"| N8N
+    N8N <-->|"docker net"| CG
+    CG <-->|"docker net"| RD
+    CG -->|"HTTPS (Anthropic-compat base URL)"| VGW
+
+    N8N <-->|"Tailscale :8002"| OC
+    N8N <-->|"Tailscale :8003"| HM
+    CG -.->|"Tailscale (optional)"| OC
+    HM <-->|"localhost :5432"| PG
+
+    classDef brain   fill:#FEE7DC,stroke:#D97757,color:#1F2937;
+    classDef hands   fill:#DBEAFE,stroke:#3B82F6,color:#1F2937;
+    classDef memory  fill:#EDE9FE,stroke:#8B5CF6,color:#1F2937;
+    classDef store   fill:#D1FAE5,stroke:#10B981,color:#1F2937;
+    classDef ctrl    fill:#F3F4F6,stroke:#6B7280,color:#1F2937;
+    classDef ext     fill:#FEF3C7,stroke:#F59E0B,color:#1F2937;
+    classDef net     fill:#FFFFFF,stroke:#111827,color:#1F2937;
+
+    class CG brain
+    class OC hands
+    class HM memory
+    class RD,PG store
+    class N8N ctrl
+    class VGW ext
+    class Internet net
+```
+
+| VM | Runs | Runtime | Public port | Tailscale ports |
+|---|---|---|---|---|
+| **VM-1** | n8n · claude-gateway · redis | Docker Compose | `5678` (n8n UI) | `8001`, `6379` (internal) |
+| **VM-2** | openclaw | native systemd | — | `8002` |
+| **VM-3** | hermes · postgres+pgvector | native systemd | — | `8003`, `5432` |
+
+> The Gateforge-Loom contract is **transport-agnostic** — agents talk via JSON
+> over HTTP with `INTERNAL_API_TOKEN` auth. Whether an agent runs as a Docker
+> container or a native systemd service is invisible to n8n and the Brain.
+
+---
+
+## 6. Install-flow diagram (cluster bring-up)
+
+The order of operations to stand up the cluster from scratch. Color-coded per
+VM. Provision the Tailnet first so every VM can resolve the others before you
+wire `.env` files.
+
+```mermaid
+flowchart TD
+    Start(["Start"]) --> TS["Provision Tailnet<br/>+ join all 3 VMs"]
+
+    TS --> V3a["VM-3: install Postgres 16 + pgvector"]
+    V3a --> V3b["VM-3: run infra/postgres/init.sql<br/>(schema + seed SOP)"]
+    V3b --> V3c["VM-3: install hermes venv<br/>+ hermes.service (systemd)"]
+    V3c --> V3d["VM-3: lock Postgres to localhost + Tailscale IP"]
+
+    TS --> V2a["VM-2: install python3.12 venv"]
+    V2a --> V2b["VM-2: install openclaw<br/>+ openclaw.service (systemd)"]
+    V2b --> V2c["VM-2: (optional) Playwright install chromium"]
+
+    TS --> V1a["VM-1: install Docker + Compose"]
+    V1a --> V1b["VM-1: clone repo, set .env<br/>(STUB_MODE=0 + Vercel key + Tailscale IPs)"]
+    V1b --> V1c["VM-1: trim docker-compose.yml<br/>(n8n + claude-gateway + redis only)"]
+    V1c --> V1d["VM-1: make up"]
+
+    V3d --> Health{"All 3 /health<br/>endpoints green?"}
+    V2c --> Health
+    V1d --> Health
+
+    Health -- "no" --> Fix["Check Tailscale IPs<br/>+ INTERNAL_API_TOKEN match"]
+    Fix --> Health
+    Health -- "yes" --> Import["VM-1: import workflow,<br/>point HTTP nodes at Tailscale IPs"]
+    Import --> Smoke["make test (end-to-end smoke)"]
+    Smoke --> Done(["✅ Cluster live"])
+
+    classDef vm1 fill:#FEE7DC,stroke:#D97757,color:#1F2937;
+    classDef vm2 fill:#DBEAFE,stroke:#3B82F6,color:#1F2937;
+    classDef vm3 fill:#EDE9FE,stroke:#8B5CF6,color:#1F2937;
+    classDef ctrl fill:#F3F4F6,stroke:#6B7280,color:#1F2937;
+    classDef ok  fill:#D1FAE5,stroke:#10B981,color:#1F2937;
+
+    class V1a,V1b,V1c,V1d vm1
+    class V2a,V2b,V2c vm2
+    class V3a,V3b,V3c,V3d vm3
+    class TS,Health,Fix,Import,Smoke ctrl
+    class Start,Done ok
+```
+
+---
+
 ## Components
 
-Each component is **one Docker container**. Read
-[`docs/components.md`](docs/components.md) for the deep dive; quick summary
-below.
+Quick summary below; read [`docs/components.md`](docs/components.md) for the
+deep dive. The **runtime** column reflects the 3-VM hybrid topology.
 
-### 🧠 `claude-gateway` (Brain)
+### 🧠 `claude-gateway` (Brain) — VM-1, Docker
 
 - **Image:** `gateforge-loom/claude-gateway` (Python 3.12 + FastAPI)
 - **Port:** 8001 (host) → 8000 (container)
 - **Endpoints:** `GET /health`, `POST /plan`, `POST /merge`, `POST /synthesize`
-- **Job:** thin wrapper around an LLM (Anthropic by default; pluggable). Owns
-  *all* reasoning. Returns structured JSON only — never executes side
-  effects.
+- **Job:** thin wrapper around an LLM. Owns *all* reasoning. Returns structured
+  JSON only — never executes side effects.
+- **LLM routing:** reaches Anthropic through the **Vercel AI Gateway** via an
+  Anthropic-compatible base URL, so it stays reachable from HK. Set
+  `ANTHROPIC_BASE_URL=https://ai-gateway.vercel.sh/v1/anthropic`,
+  `ANTHROPIC_API_KEY=<vercel-gateway-key>`, and `CLAUDE_MODEL` to an Opus model.
 - **Stub mode:** `STUB_MODE=1` returns canned plans so you can wire the full
-  pipeline before adding API keys.
+  pipeline before adding API keys; set `STUB_MODE=0` for live calls.
 
-### ✋ `openclaw` (Hands)
+### ✋ `openclaw` (Hands) — VM-2, native systemd
 
-- **Image:** `gateforge-loom/openclaw` (Python 3.12 + FastAPI)
-- **Port:** 8002 → 8000
+- **Runtime:** Python 3.12 venv under `/opt/openclaw`, run by `openclaw.service`
+- **Port:** 8002
 - **Endpoints:** `GET /health`, `GET /tools`, `POST /execute`
 - **Job:** runs one plan step against one registered tool. Built-in tool
   catalogue covers `web.fetch`, `browser.action`, `shell.run`, `api.call`.
   Failures are explicit (`status=error`, `retryable` flag) — n8n decides
   whether to retry.
-- **Sandboxing:** ships rootless; mount tool-specific volumes only.
+- **Sandboxing:** systemd hardening (`ProtectSystem=strict`, `NoNewPrivileges`,
+  `PrivateTmp`); Playwright/Chromium installed in the venv for `browser.action`.
 
-### 📚 `hermes` (Memory)
+### 📚 `hermes` (Memory) — VM-3, native systemd
 
-- **Image:** `gateforge-loom/hermes` (Python 3.12 + FastAPI + psycopg)
-- **Port:** 8003 → 8000
+- **Runtime:** Python 3.12 venv under `/opt/hermes`, run by `hermes.service`
+- **Port:** 8003
 - **Endpoints:** `GET /health`, `POST /recall`, `POST /write`
-- **Job:** vector-search SOP & episodic memories on `/recall`; persist
-  episode + bump SOP versions on `/write`. Uses Postgres `vector(1536)`
-  columns; ready to plug in any embedding provider.
+- **Job:** vector-search SOP & episodic memories on `/recall`; persist episode
+  + bump SOP versions on `/write`. Uses Postgres `vector(1536)` columns.
 - **Degradable:** if Postgres is down, `/recall` returns empty hits so the
   rest of the pipeline keeps running.
 
-### 🚌 `redis` (State bus)
+### 🚌 `redis` (State bus) — VM-1, Docker
 
 - **Image:** `redis:7-alpine`
 - **Port:** 6379
@@ -347,29 +500,37 @@ below.
   ```
 - TTL: 7 days for active job keys; persisted via AOF.
 
-### 🗄 `postgres` (Long-term memory)
+### 🗄 `postgres` (Long-term memory) — VM-3, native
 
-- **Image:** `pgvector/pgvector:pg16`
-- **Port:** 5432
+- **Package:** `postgresql-16` + `postgresql-16-pgvector`
+- **Port:** 5432 (bound to localhost + Tailscale IP only)
 - **Job:** durable storage for `episodic_memory` and `sop` tables. Schema
-  initialised by [`infra/postgres/init.sql`](infra/postgres/init.sql) on
-  first boot — includes one seed SOP so `/recall` returns data on day 1.
+  initialised by [`infra/postgres/init.sql`](infra/postgres/init.sql) —
+  includes one seed SOP so `/recall` returns data on day 1.
 - **Indexes:** B-tree on intent + created_at; ivfflat on `embedding` once
   data exists.
 
-### 🎼 `n8n` (Orchestrator)
+### 🎼 `n8n` (Orchestrator) — VM-1, Docker
 
 - **Image:** `n8nio/n8n:latest`
-- **Port:** 5678
+- **Port:** 5678 (the only public-facing UI)
 - **Job:** owns control flow — sequencing, retries, fan-out, output sinks.
-  The only externally-exposed UI; everything else lives behind it on
-  `loomnet`.
-- **Imports:** `n8n/workflows/gateforge-loom-pipeline.json` is mounted
-  read-only into the container at `/workflows`.
+- **Imports:** `n8n/workflows/gateforge-loom-pipeline.json`. After import,
+  point the Hermes/OpenClaw HTTP nodes at the **Tailscale IPs** of VM-3/VM-2.
+
+### ☁️ `Vercel AI Gateway` (LLM provider) — external
+
+- **Endpoint:** `https://ai-gateway.vercel.sh/v1/anthropic` (Anthropic-compatible)
+- **Job:** proxies Brain calls to Claude Opus, reachable from regions where
+  `api.anthropic.com` is blocked. Adds provider failover and cost tracking in
+  the Vercel dashboard. The `claude-gateway` code is unchanged except for the
+  `base_url` it points at.
 
 ---
 
 ## Quick start
+
+For a fast local PoC, everything still runs on **one VM** with Docker:
 
 ```bash
 git clone https://github.com/tonylnng/gateforge-loom.git
@@ -383,26 +544,428 @@ make test                        # end-to-end smoke test
 Then open <http://localhost:5678> (n8n) and import
 `n8n/workflows/gateforge-loom-pipeline.json`.
 
+For the production **3-VM hybrid** layout, follow the per-VM install sections
+below.
+
 ---
 
-## VM deployment
+## Deployment topology
 
-Gateforge-Loom is designed for a **single Linux VM** (Ubuntu 22.04 LTS
-recommended) with Docker Engine + Docker Compose v2. See
-[`docs/deployment.md`](docs/deployment.md) for the full guide. Headlines:
+```
+                ┌─────────────────────────────────┐
+                │  VM-1: Brain + Orchestrator      │
+                │  (Docker)                        │
+                │  - n8n         :5678  (public)   │
+                │  - claude-gw   :8001             │──→ Vercel AI Gateway
+                │  - redis       :6379             │    (Anthropic-compat base URL)
+                └────────┬────────────────┬────────┘
+                         │  Tailscale     │
+                         ▼                ▼
+              ┌──────────────┐    ┌────────────────┐
+              │  VM-2 (native)│    │  VM-3 (native) │
+              │  - openclaw   │    │  - hermes      │
+              │    (systemd)  │    │  - postgres    │
+              │  :8002        │    │    + pgvector  │
+              └──────────────┘    │  :8003  :5432  │
+                                  └────────────────┘
+```
 
-- **Minimum VM:** 2 vCPU, 4 GB RAM, 30 GB disk for stub mode + light usage.
-- **Recommended:** 4 vCPU, 8 GB RAM, 80 GB disk if running live LLM calls
-  + Playwright browsers inside OpenClaw.
-- **Networking:** only port `5678` (n8n) needs to be public; everything else
-  is reachable on `loomnet` only. Optionally expose 8001-8003 over Tailscale
-  for local dev access.
-- **Secrets:** managed via `.env` on disk (mode `600`) or systemd
-  `EnvironmentFile`. Rotate `INTERNAL_API_TOKEN` and `N8N_ENCRYPTION_KEY`
-  before going to staging.
-- **Backups:** snapshot the `postgres-data` and `n8n-data` volumes nightly.
-  Redis is stateful but recoverable — episodic memory is the only durable
-  asset.
+| Resource | VM-1 (Brain+Orch) | VM-2 (Hands) | VM-3 (Memory) |
+|---|---|---|---|
+| **OS** | Ubuntu 22.04 LTS | Ubuntu 22.04 LTS | Ubuntu 22.04 LTS |
+| **vCPU** | 4 | 2 (4 with Playwright) | 2 |
+| **RAM** | 8 GB | 4 GB (8 GB w/ browsers) | 4 GB |
+| **Disk** | 80 GB SSD | 40 GB SSD | 80 GB SSD (DB growth) |
+| **Runtime** | Docker Compose | native systemd | native systemd |
+| **Public port** | 5678 | none | none |
+
+All three VMs share one `INTERNAL_API_TOKEN` and live on the same Tailnet.
+Pick a region close to the Vercel AI Gateway edge (HK / Singapore / Tokyo).
+
+---
+
+## VM-1 install — Brain + Orchestrator (Docker)
+
+VM-1 hosts the Brain, n8n, and the Redis state bus in Docker.
+
+### 1. Base system + Docker
+
+```bash
+sudo apt update && sudo apt upgrade -y
+sudo apt install -y curl git ufw fail2ban
+sudo timedatectl set-timezone Asia/Hong_Kong
+
+curl -fsSL https://get.docker.com | sudo sh
+sudo usermod -aG docker "$USER"      # re-login for group change
+docker --version && docker compose version
+```
+
+### 2. Tailscale + firewall
+
+```bash
+curl -fsSL https://tailscale.com/install.sh | sh
+sudo tailscale up --hostname=loom-brain
+# note the Tailscale IPs of all 3 VMs — you'll need them in .env
+
+sudo ufw default deny incoming
+sudo ufw default allow outgoing
+sudo ufw allow 22/tcp                 # SSH
+sudo ufw allow 5678/tcp               # n8n UI (public)
+sudo ufw allow in on tailscale0       # all internal traffic
+sudo ufw enable
+```
+
+### 3. Clone + configure `.env`
+
+```bash
+cd /opt
+sudo git clone https://github.com/tonylnng/gateforge-loom.git
+sudo chown -R "$USER":"$USER" gateforge-loom
+cd gateforge-loom
+cp .env.example .env
+chmod 600 .env
+```
+
+Edit `.env` for Vercel routing + cross-VM Tailscale IPs:
+
+```bash
+# Brain (claude-gateway) — route through Vercel AI Gateway
+STUB_MODE=0
+ANTHROPIC_API_KEY=<your-vercel-ai-gateway-key>
+ANTHROPIC_BASE_URL=https://ai-gateway.vercel.sh/v1/anthropic
+CLAUDE_MODEL=claude-opus-4-7
+
+# Cross-VM service URLs (use Tailscale IPs)
+OPENCLAW_URL=http://100.x.x.2:8002
+HERMES_URL=http://100.x.x.3:8003
+
+# Shared secrets (must match VM-2 and VM-3)
+INTERNAL_API_TOKEN=<rotate-32-byte-hex>
+N8N_ENCRYPTION_KEY=<rotate-32-byte-hex>
+
+# n8n
+N8N_HOST=<your-domain-or-ip>
+N8N_PROTOCOL=https
+WEBHOOK_URL=https://<your-domain>/
+```
+
+> The `claude-gateway` already constructs its Anthropic client from
+> `ANTHROPIC_API_KEY` and `ANTHROPIC_BASE_URL`. Pointing `ANTHROPIC_BASE_URL`
+> at the Vercel endpoint is the single change that unlocks HK reachability
+> while keeping the Brain layer intact.
+
+### 4. Trim `docker-compose.yml` for VM-1
+
+On VM-1 you only need `n8n`, `claude-gateway`, and `redis`. Comment out or
+remove the `openclaw`, `hermes`, and `postgres` blocks — those run natively on
+VM-2 and VM-3.
+
+### 5. Bring it up
+
+```bash
+make up        # builds + starts n8n, claude-gateway, redis
+make health    # all three should report healthy
+make test      # end-to-end smoke test across all 3 VMs
+```
+
+### 6. Import the workflow
+
+Open `http://<vm-1-ip>:5678`, import
+`n8n/workflows/gateforge-loom-pipeline.json`, then edit the HTTP node URLs:
+
+| n8n Node | URL |
+|---|---|
+| Claude `/plan` · `/merge` · `/synthesize` | `http://claude-gateway:8001/...` (Docker network, same VM) |
+| Hermes `/recall` · `/write` | `http://100.x.x.3:8003/...` (Tailscale IP of VM-3) |
+| OpenClaw `/execute` | `http://100.x.x.2:8002/execute` (Tailscale IP of VM-2) |
+
+---
+
+## VM-2 install — OpenClaw native (Hands)
+
+VM-2 runs OpenClaw directly as a systemd service — no Docker.
+
+### 1. Prerequisites + service user
+
+```bash
+sudo apt update && sudo apt install -y \
+    python3.12 python3.12-venv python3-pip git curl ufw fail2ban
+
+sudo useradd --system --create-home --shell /bin/bash openclaw
+sudo mkdir -p /opt/openclaw /var/log/openclaw
+sudo chown -R openclaw:openclaw /opt/openclaw /var/log/openclaw
+```
+
+### 2. Clone + install into a venv
+
+```bash
+sudo -u openclaw bash <<'EOF'
+cd /opt/openclaw
+git clone https://github.com/tonylnng/gateforge-loom.git src
+cd src/services/openclaw
+python3.12 -m venv /opt/openclaw/venv
+/opt/openclaw/venv/bin/pip install -r requirements.txt
+/opt/openclaw/venv/bin/pip install "uvicorn[standard]"
+EOF
+```
+
+### 3. Environment file
+
+```bash
+sudo tee /etc/openclaw.env >/dev/null <<EOF
+INTERNAL_API_TOKEN=<same-as-VM-1>
+LOG_LEVEL=INFO
+STUB_MODE=0
+TOOL_TIMEOUT_SEC=60
+EOF
+sudo chmod 600 /etc/openclaw.env
+sudo chown openclaw:openclaw /etc/openclaw.env
+```
+
+### 4. systemd unit
+
+```bash
+sudo tee /etc/systemd/system/openclaw.service >/dev/null <<'EOF'
+[Unit]
+Description=OpenClaw (Gateforge-Loom Hands agent)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=openclaw
+Group=openclaw
+WorkingDirectory=/opt/openclaw/src/services/openclaw
+EnvironmentFile=/etc/openclaw.env
+ExecStart=/opt/openclaw/venv/bin/uvicorn app.main:app \
+          --host 0.0.0.0 --port 8002 --workers 2
+Restart=on-failure
+RestartSec=5
+StandardOutput=append:/var/log/openclaw/stdout.log
+StandardError=append:/var/log/openclaw/stderr.log
+
+# Hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=/var/log/openclaw /opt/openclaw
+ProtectHome=true
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+sudo systemctl daemon-reload
+sudo systemctl enable --now openclaw
+sudo systemctl status openclaw
+```
+
+### 5. (Optional) Playwright for `browser.action`
+
+```bash
+sudo -u openclaw /opt/openclaw/venv/bin/pip install playwright
+sudo -u openclaw /opt/openclaw/venv/bin/playwright install chromium
+sudo /opt/openclaw/venv/bin/playwright install-deps chromium
+```
+
+### 6. Tailscale + firewall
+
+```bash
+curl -fsSL https://tailscale.com/install.sh | sh
+sudo tailscale up --hostname=loom-hands
+sudo ufw default deny incoming
+sudo ufw allow 22/tcp
+sudo ufw allow in on tailscale0       # exposes 8002 only over the tailnet
+sudo ufw enable
+```
+
+---
+
+## VM-3 install — Hermes native (Memory)
+
+VM-3 runs both Hermes and Postgres+pgvector natively.
+
+### 1. Postgres 16 + pgvector
+
+```bash
+sudo apt update && sudo apt install -y \
+    python3.12 python3.12-venv python3-pip git curl ufw fail2ban \
+    postgresql-16 postgresql-16-pgvector
+sudo systemctl enable --now postgresql
+```
+
+### 2. Initialise the database (use the repo's init.sql)
+
+```bash
+sudo -u postgres psql <<'EOF'
+CREATE USER hermes WITH PASSWORD '<strong-pw>';
+CREATE DATABASE hermes_db OWNER hermes;
+\c hermes_db
+CREATE EXTENSION IF NOT EXISTS vector;
+EOF
+
+# Load the seed schema from the repo (ships a seed SOP so /recall works day 1)
+git clone https://github.com/tonylnng/gateforge-loom.git /tmp/gfl
+sudo -u postgres psql -d hermes_db -f /tmp/gfl/infra/postgres/init.sql
+```
+
+### 3. Service user + install Hermes
+
+```bash
+sudo useradd --system --create-home --shell /bin/bash hermes
+sudo mkdir -p /opt/hermes /var/log/hermes
+sudo chown -R hermes:hermes /opt/hermes /var/log/hermes
+
+sudo -u hermes bash <<'EOF'
+cd /opt/hermes
+git clone https://github.com/tonylnng/gateforge-loom.git src
+cd src/services/hermes
+python3.12 -m venv /opt/hermes/venv
+/opt/hermes/venv/bin/pip install -r requirements.txt
+/opt/hermes/venv/bin/pip install "uvicorn[standard]"
+EOF
+```
+
+### 4. Environment file
+
+```bash
+sudo tee /etc/hermes.env >/dev/null <<EOF
+INTERNAL_API_TOKEN=<same-as-VM-1>
+DATABASE_URL=postgresql://hermes:<strong-pw>@localhost:5432/hermes_db
+LOG_LEVEL=INFO
+EMBEDDING_PROVIDER=stub
+EOF
+sudo chmod 600 /etc/hermes.env
+sudo chown hermes:hermes /etc/hermes.env
+```
+
+### 5. systemd unit
+
+```bash
+sudo tee /etc/systemd/system/hermes.service >/dev/null <<'EOF'
+[Unit]
+Description=Hermes (Gateforge-Loom Memory agent)
+After=network-online.target postgresql.service
+Wants=network-online.target
+Requires=postgresql.service
+
+[Service]
+Type=simple
+User=hermes
+Group=hermes
+WorkingDirectory=/opt/hermes/src/services/hermes
+EnvironmentFile=/etc/hermes.env
+ExecStart=/opt/hermes/venv/bin/uvicorn app.main:app \
+          --host 0.0.0.0 --port 8003 --workers 2
+Restart=on-failure
+RestartSec=5
+StandardOutput=append:/var/log/hermes/stdout.log
+StandardError=append:/var/log/hermes/stderr.log
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=/var/log/hermes /opt/hermes
+ProtectHome=true
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+sudo systemctl daemon-reload
+sudo systemctl enable --now hermes
+sudo systemctl status hermes
+```
+
+### 6. Lock Postgres to localhost + Tailscale, then firewall
+
+Edit `/etc/postgresql/16/main/postgresql.conf`:
+
+```
+listen_addresses = 'localhost,100.x.x.3'   # Tailscale IP only
+```
+
+Edit `/etc/postgresql/16/main/pg_hba.conf`:
+
+```
+host hermes_db hermes 100.0.0.0/8 scram-sha-256
+```
+
+Reload and firewall:
+
+```bash
+sudo systemctl restart postgresql
+curl -fsSL https://tailscale.com/install.sh | sh
+sudo tailscale up --hostname=loom-memory
+sudo ufw default deny incoming
+sudo ufw allow 22/tcp
+sudo ufw allow in on tailscale0       # exposes 8003 + 5432 only over the tailnet
+sudo ufw enable
+```
+
+---
+
+## Backup & recovery
+
+> The episodic memory in Postgres is **the only durable asset** in the stack —
+> Redis state is recoverable, and n8n workflows live in the repo. Protect VM-3.
+
+### Nightly Postgres backup (VM-3, native)
+
+```bash
+sudo tee /etc/cron.daily/hermes-backup >/dev/null <<'EOF'
+#!/bin/bash
+set -euo pipefail
+DEST=/var/backups/hermes
+mkdir -p "$DEST"
+pg_dump -U hermes hermes_db | gzip > "$DEST/hermes-$(date +%F).sql.gz"
+# Retain 30 days
+find "$DEST" -name "hermes-*.sql.gz" -mtime +30 -delete
+EOF
+sudo chmod +x /etc/cron.daily/hermes-backup
+```
+
+### Off-VM rotation (recommended)
+
+Push the nightly dump off-box so a VM loss doesn't lose memory:
+
+```bash
+# after pg_dump, sync to object storage (S3 / MinIO / B2)
+aws s3 cp /var/backups/hermes/hermes-$(date +%F).sql.gz \
+  s3://your-bucket/gateforge-loom/hermes/
+```
+
+### n8n volume backup (VM-1, Docker)
+
+```bash
+docker run --rm \
+  -v gateforge-loom_n8n-data:/src:ro \
+  -v /var/backups/gateforge-loom:/dst \
+  alpine tar czf "/dst/n8n-$(date +%F).tgz" -C /src .
+```
+
+### Restore drill
+
+```bash
+# On a fresh VM-3, after CREATE DATABASE hermes_db + CREATE EXTENSION vector:
+gunzip -c hermes-2026-06-02.sql.gz | sudo -u postgres psql -d hermes_db
+sudo systemctl restart hermes
+curl http://100.x.x.3:8003/health    # expect healthy, not degraded
+```
+
+Test restore quarterly. A backup you haven't restored is a wish, not a backup.
+
+---
+
+## Operations cheatsheet
+
+| Task | VM-1 (Brain+Orch) | VM-2 (OpenClaw) | VM-3 (Hermes) |
+|---|---|---|---|
+| **Status** | `docker compose ps` | `systemctl status openclaw` | `systemctl status hermes postgresql` |
+| **Logs** | `docker compose logs -f` | `journalctl -u openclaw -f` | `journalctl -u hermes -f` |
+| **Restart** | `make up` | `sudo systemctl restart openclaw` | `sudo systemctl restart hermes` |
+| **Update code** | `git pull && make build && make up` | `cd /opt/openclaw/src && sudo -u openclaw git pull && sudo systemctl restart openclaw` | `cd /opt/hermes/src && sudo -u hermes git pull && sudo systemctl restart hermes` |
+| **Health (from VM-1)** | `docker exec gfl-claude-gateway curl -s http://localhost:8000/health` | `curl http://100.x.x.2:8002/health` | `curl http://100.x.x.3:8003/health` |
 
 ---
 
@@ -412,14 +975,15 @@ The whole point of the loom metaphor: more threads, same machine.
 
 1. **Scaffold a new service** — copy `services/openclaw/` to
    `services/<your-agent>/`, rename the FastAPI app, define endpoints.
-2. **Add a Compose block** — append a new service in `docker-compose.yml`
-   with `networks: [loomnet]` and a `/health` healthcheck.
-3. **Register tools (optional)** — if it's an executor, expose a `GET
-   /tools` manifest so Claude can discover its capabilities.
-4. **Add an n8n node** — drop an HTTP Request node in the workflow at the
-   right point. Reroute connections.
-5. **Update docs** — add a row to the components table here and a section
-   in `docs/components.md`.
+2. **Deploy it** — either add a Compose block on VM-1 (`networks: [loomnet]`
+   + a `/health` healthcheck) or install it natively as a new systemd service
+   on its own VM, following the VM-2 pattern.
+3. **Register tools (optional)** — if it's an executor, expose a `GET /tools`
+   manifest so the Brain can discover its capabilities.
+4. **Add an n8n node** — drop an HTTP Request node in the workflow at the right
+   point, pointing at the new service's Tailscale IP. Reroute connections.
+5. **Update docs** — add a row to the components table here and a section in
+   `docs/components.md`.
 
 Examples of agents that fit naturally:
 
@@ -439,21 +1003,21 @@ Examples of agents that fit naturally:
 gateforge-loom/
 ├── README.md                  # this file
 ├── Makefile                   # up · down · health · test · clean · nuke
-├── docker-compose.yml         # full stack
+├── docker-compose.yml         # full stack (trim to n8n+brain+redis for VM-1)
 ├── .env.example
 ├── docs/
 │   ├── components.md          # per-component deep dive
 │   ├── api-contract.md        # endpoint reference
 │   ├── deployment.md          # VM bring-up, hardening, backups
 │   └── architecture.md        # design decisions + extension points
-├── infra/postgres/init.sql    # pgvector + tables + seed SOP
-├── n8n/workflows/             # importable workflow JSON
+├── infra/postgres/init.sql    # pgvector + tables + seed SOP (load on VM-3)
+├── n8n/workflows/             # importable workflow JSON (VM-1)
 ├── schemas/                   # JSON Schemas for tool I/O
 ├── scripts/                   # health + smoke-test
 └── services/
-    ├── claude-gateway/        # 🧠 Brain
-    ├── openclaw/              # ✋ Hands
-    └── hermes/                # 📚 Memory
+    ├── claude-gateway/        # 🧠 Brain   → VM-1 (Docker)
+    ├── openclaw/              # ✋ Hands   → VM-2 (native systemd)
+    └── hermes/                # 📚 Memory  → VM-3 (native systemd)
 ```
 
 ---
@@ -461,7 +1025,8 @@ gateforge-loom/
 ## Roadmap
 
 - [x] Phase 1 — stub services + n8n wiring + smoke test
-- [ ] Phase 2 — wire real Anthropic API in `claude-gateway` (structured tool use)
+- [x] Phase 1.5 — 3-VM hybrid topology (Docker Brain/Orch + native Hands/Memory) over Tailscale
+- [ ] Phase 2 — live Brain via **Vercel AI Gateway** (Claude Opus, Anthropic-compatible base URL)
 - [ ] Phase 3 — Playwright tool inside `openclaw`
 - [ ] Phase 4 — real embeddings in `hermes` (voyage-3 or text-embedding-3-small)
 - [ ] Phase 5 — Validator + Critic agents
