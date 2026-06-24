@@ -227,6 +227,129 @@ Response:
 
 ---
 
+## Knowledge — `hermes-dmoe` (port 8004)
+
+> **Optional service.** `hermes-dmoe` is the parameter-level knowledge
+> sibling of `hermes`. It self-hosts a small open-weight base model
+> (Llama-3.2-1B / Qwen2.5-1.5B) with a bank of per-knowledge-unit LoRA
+> experts, and injects domain knowledge *into the weights* at decode time
+> via Decoupled Mixture-of-Experts (DMoE). It is **not** on the default
+> critical path — Brain/Hands/Memory work without it. See
+> [`docs/references/README.md`](references/README.md) for the source paper.
+
+### `GET /health`
+```json
+{
+  "status": "ok",
+  "service": "hermes-dmoe",
+  "stub_mode": true,
+  "base_model": "Qwen2.5-1.5B",
+  "experts_loaded": 27613,
+  "bank_size_gib": 13.08,
+  "router": "bm25",
+  "tau": 2.0,
+  "top_k": 3,
+  "ts": "..."
+}
+```
+
+### `GET /experts`
+Returns a summary of the LoRA expert bank (the router's surrogate index).
+```json
+{
+  "count": 27613,
+  "base_model": "Qwen2.5-1.5B",
+  "lora": { "rank": 4, "alpha": 16, "target": "final_ffn" },
+  "avg_expert_kib": 481,
+  "experts": [
+    {
+      "id": "kb.hk_pdpo_s2",
+      "surrogate_text": "HK PDPO Data Protection Principle 2 — accuracy & retention...",
+      "tokens": 412,
+      "updated_at": "2026-06-20T08:00:00+00:00"
+    }
+  ]
+}
+```
+
+### `POST /inject`
+
+Generate an answer with on-demand parametric knowledge injection. The base
+model decodes normally; at each step the token entropy
+`TU_t = -Σ p_t(v) log p_t(v)` is measured, and **only when `TU_t > tau`** does
+the BM25 router select the Top-k experts for the current query span and merge
+their LoRA deltas into the effective weights (`θ_eff = θ + Σ Δθ_i`).
+
+Request:
+```json
+{
+  "job_id": "job_2026_05_08_a3f7",
+  "prompt": "What retention limit applies to patient records under HK PDPO?",
+  "max_tokens": 512,
+  "tau": 2.0,
+  "top_k": 3
+}
+```
+`tau` and `top_k` are optional per-request overrides of the service defaults.
+
+Response:
+```json
+{
+  "job_id": "job_2026_05_08_a3f7",
+  "answer": "Under HK PDPO DPP2, personal data must not be kept longer than...",
+  "experts_used": ["kb.hk_pdpo_s2", "kb.hk_pdpo_dpp2", "kb.med_record_retention"],
+  "trigger_count": 4,
+  "tokens_in": 38,
+  "tokens_out": 121
+}
+```
+`trigger_count` is how many decode steps exceeded `tau` and fired the router;
+`experts_used` is the union of experts merged across all triggers.
+
+### `POST /experts/upsert`
+
+Add or replace a knowledge expert. The base model stays frozen; only a new
+LoRA adapter is trained (rank 4, α=16, lr 1e-5, 1 epoch, final-layer FFN) and
+the router's BM25 index is updated incrementally — no full re-index, no
+base-model retraining.
+
+Request:
+```json
+{
+  "id": "kb.hk_pdpo_s2",
+  "source_text": "<canonical passage>",
+  "surrogate_text": "HK PDPO Data Protection Principle 2 — accuracy & retention...",
+  "qa_pairs": [
+    {"q": "How long may records be kept?", "a": "No longer than necessary..."}
+  ]
+}
+```
+If `qa_pairs` is omitted the service synthesises 1 paraphrase + 3 Q&A pairs
+(PRAG recipe) before training the adapter.
+
+Response:
+```json
+{
+  "stored": { "id": "kb.hk_pdpo_s2", "expert_kib": 481, "reindexed": true }
+}
+```
+
+### `DELETE /experts/{id}`
+
+Remove an expert adapter and drop it from the router index. Because experts
+are decoupled from the frozen base, deletion is instant and leaves the base
+model and all other experts untouched.
+```json
+{ "deleted": "kb.hk_pdpo_s2", "reindexed": true }
+```
+
+> **PHI / regulated data:** do **not** bake patient-identifiable or otherwise
+> regulated data into experts — once trained into a LoRA delta it is not
+> cleanly retrievable or redactable. Keep that class of data in `hermes`
+> (`/recall` + `/write`), which supports targeted deletion and redaction.
+
+---
+
 ## Error codes
 
 | Code | Service | Meaning | Retryable |
@@ -237,3 +360,7 @@ Response:
 | `SCHEMA_INVALID` | n8n validator | Output didn't match expected schema | once with `repair=true` |
 | `BUDGET_EXCEEDED` | Claude Gateway | Per-job token budget hit | no |
 | `DB_UNAVAILABLE` | Hermes | Postgres down | no — degrade gracefully |
+| `EXPERT_NOT_FOUND` | hermes-dmoe | No expert with that `id` | no |
+| `BANK_OOM` | hermes-dmoe | Expert bank exceeded GPU/host memory | no — evict or shard |
+| `ROUTER_EMPTY` | hermes-dmoe | BM25 index has no experts to select | no — upsert experts first |
+| `BASE_MODEL_UNAVAILABLE` | hermes-dmoe | Self-hosted base model not loaded | no — degrade to `hermes` RAG |

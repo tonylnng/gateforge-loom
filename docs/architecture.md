@@ -91,6 +91,52 @@ P99 recall. Hermes' API is designed so the storage backend is swappable.
 
 ---
 
+## Why DMoE for parametric memory
+
+Considered for the Memory layer: prompt-level RAG only (status quo), full
+fine-tuning, single merged LoRA, and **DMoE (Decoupled Mixture-of-Experts)**.
+
+The existing `hermes` layer is **prompt-level**: it retrieves SOP/episodic
+text and the Brain reads it as context. That is flexible and fully auditable,
+but the knowledge never enters the model's parameter space — exactly the
+shallow-injection limitation that
+[DMoE (arXiv:2606.14243)](https://arxiv.org/abs/2606.14243) was designed to fix
+(local copy: [`references/DMoE-2606.14243v1.pdf`](references/DMoE-2606.14243v1.pdf)).
+
+Picked DMoE as an **optional sibling** (`hermes-dmoe`), not a replacement,
+because:
+
+- **Parameter-level depth, RAG-level updatability.** Each knowledge unit is an
+  independent LoRA expert (`Δθ_i`). Add/update/remove one expert without
+  retraining the base or disturbing the others — the same "new thread, no
+  rewiring" property the loom already has, now inside the model.
+- **Decoupled router.** A training-free BM25 index over each expert's text
+  surrogate. Adding knowledge = inserting one index entry; no neural router to
+  retrain, no re-coupling to the backbone.
+- **Uncertainty-gated.** Experts fire only when token-entropy
+  `TU = -Σ p log p > τ` (default `τ = 2.0`), so confident decoding pays zero
+  extra cost.
+- **KV-cache safe.** Experts attach only to the final-layer FFN, so cached
+  key/value states from earlier layers stay valid (`θ_eff = θ + Σ Δθ_i`).
+
+What DMoE is **not** good for here:
+
+- **The Brain.** Claude via Anthropic/Vercel is a closed API — no weight
+  access, so DMoE cannot touch it. `hermes-dmoe` therefore runs its own
+  **self-hosted open base** (Llama-3.2-1B / Qwen2.5-1.5B in the paper).
+- **Regulated data.** Knowledge baked into weights is harder to audit and
+  redact than a retrievable row. Keep PHI / compliance-sensitive corpora in
+  `hermes` (prompt-level, redactable); reserve `hermes-dmoe` experts for
+  non-sensitive engineering and domain knowledge.
+- **Tiny corpora.** If a few documents change hourly, plain `hermes` recall is
+  simpler. DMoE pays off when the corpus is large, stable, and
+  reasoning-heavy.
+
+`hermes` and `hermes-dmoe` are complementary: fast auditable recall vs. deep
+self-hosted injection. The orchestrator decides per step which to call.
+
+---
+
 ## Stub mode
 
 Every agent ships with `STUB_MODE=1` as the default. This is non-negotiable
