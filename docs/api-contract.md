@@ -229,25 +229,51 @@ Response:
 
 ## Knowledge — `hermes-dmoe` (port 8004)
 
-> **Optional service.** `hermes-dmoe` is the parameter-level knowledge
-> sibling of `hermes`. It self-hosts a small open-weight base model
-> (Llama-3.2-1B / Qwen2.5-1.5B) with a bank of per-knowledge-unit LoRA
-> experts, and injects domain knowledge *into the weights* at decode time
-> via Decoupled Mixture-of-Experts (DMoE). It is **not** on the default
-> critical path — Brain/Hands/Memory work without it. See
+> **Optional service.** `hermes-dmoe` is the domain-knowledge sibling of
+> `hermes`, built on Decoupled Mixture-of-Experts (DMoE). It owns one expert
+> bank + a BM25 router and runs in **two modes**, selected by the `DMOE_MODE`
+> env var (per-request override via the `mode` field):
+>
+> - **`local`** (default) — true parametric DMoE: a self-hosted open base model
+>   (Llama-3.2-1B / Qwen2.5-1.5B) merges the routed LoRA deltas *into the
+>   weights* at decode time. **Requires a GPU.**
+> - **`gateway`** — router-only, no GPU: the BM25 router selects Top-k experts
+>   and their **source text** is passed as prompt context to a model behind the
+>   Vercel AI Gateway. Not weight-level DMoE — router-driven retrieval.
+>
+> Both modes share the same expert bank and the endpoints below. It is **not**
+> on the default critical path — Brain/Hands/Memory work without it. See
 > [`docs/references/README.md`](references/README.md) for the source paper.
 
 ### `GET /health`
+Reports the active `mode`. In `gateway` mode there is no self-hosted base model
+or per-token `tau`, so those fields describe the gateway target instead.
 ```json
 {
   "status": "ok",
   "service": "hermes-dmoe",
+  "mode": "local",
   "stub_mode": true,
   "base_model": "Qwen2.5-1.5B",
   "experts_loaded": 27613,
   "bank_size_gib": 13.08,
   "router": "bm25",
   "tau": 2.0,
+  "top_k": 3,
+  "ts": "..."
+}
+```
+In `gateway` mode:
+```json
+{
+  "status": "ok",
+  "service": "hermes-dmoe",
+  "mode": "gateway",
+  "stub_mode": true,
+  "gateway_model": "claude-opus-4",
+  "gateway_base_url": "https://ai-gateway.vercel.sh/v1/anthropic",
+  "experts_loaded": 27613,
+  "router": "bm25",
   "top_k": 3,
   "ts": "..."
 }
@@ -274,37 +300,63 @@ Returns a summary of the LoRA expert bank (the router's surrogate index).
 
 ### `POST /inject`
 
-Generate an answer with on-demand parametric knowledge injection. The base
-model decodes normally; at each step the token entropy
-`TU_t = -Σ p_t(v) log p_t(v)` is measured, and **only when `TU_t > tau`** does
-the BM25 router select the Top-k experts for the current query span and merge
-their LoRA deltas into the effective weights (`θ_eff = θ + Σ Δθ_i`).
+Generate an answer with on-demand domain-knowledge injection. Behaviour depends
+on the active mode (service-wide `DMOE_MODE`, overridable per request via
+`mode`):
+
+- **`local`** — the base model decodes normally; at each step the token entropy
+  `TU_t = -Σ p_t(v) log p_t(v)` is measured, and **only when `TU_t > tau`** does
+  the BM25 router select the Top-k experts for the current query span and merge
+  their LoRA deltas into the effective weights (`θ_eff = θ + Σ Δθ_i`).
+- **`gateway`** — one BM25 routing pass over the prompt selects the Top-k
+  experts; their source text is assembled into a context block and sent in a
+  **single** chat-completion call to the Vercel AI Gateway. There is no
+  per-token entropy gate, so `tau` is ignored.
 
 Request:
 ```json
 {
   "job_id": "job_2026_05_08_a3f7",
   "prompt": "What retention limit applies to patient records under HK PDPO?",
+  "mode": "local",
   "max_tokens": 512,
   "tau": 2.0,
   "top_k": 3
 }
 ```
-`tau` and `top_k` are optional per-request overrides of the service defaults.
+`mode` is optional (defaults to the service's `DMOE_MODE`). `tau` and `top_k`
+are optional per-request overrides of the service defaults; `tau` applies to
+`local` only.
 
-Response:
+Response (`local`):
 ```json
 {
   "job_id": "job_2026_05_08_a3f7",
   "answer": "Under HK PDPO DPP2, personal data must not be kept longer than...",
+  "mode": "local",
   "experts_used": ["kb.hk_pdpo_s2", "kb.hk_pdpo_dpp2", "kb.med_record_retention"],
   "trigger_count": 4,
   "tokens_in": 38,
   "tokens_out": 121
 }
 ```
-`trigger_count` is how many decode steps exceeded `tau` and fired the router;
-`experts_used` is the union of experts merged across all triggers.
+Response (`gateway`):
+```json
+{
+  "job_id": "job_2026_05_08_a3f7",
+  "answer": "Under HK PDPO DPP2, personal data must not be kept longer than...",
+  "mode": "gateway",
+  "experts_used": ["kb.hk_pdpo_s2", "kb.hk_pdpo_dpp2", "kb.med_record_retention"],
+  "trigger_count": null,
+  "gateway_model": "claude-opus-4",
+  "tokens_in": 38,
+  "tokens_out": 121
+}
+```
+`mode` echoes which path served the request. `experts_used` is the set of
+routed experts. `trigger_count` is how many decode steps exceeded `tau` and
+fired the router in `local` mode; it is `null` in `gateway` mode (single call,
+no per-token gate).
 
 ### `POST /experts/upsert`
 
@@ -343,9 +395,10 @@ model and all other experts untouched.
 { "deleted": "kb.hk_pdpo_s2", "reindexed": true }
 ```
 
-> **PHI / regulated data:** do **not** bake patient-identifiable or otherwise
-> regulated data into experts — once trained into a LoRA delta it is not
-> cleanly retrievable or redactable. Keep that class of data in `hermes`
+> **PHI / regulated data (both modes):** do **not** bake patient-identifiable
+> or otherwise regulated data into experts (in `local` a LoRA delta is not
+> cleanly retrievable or redactable; in `gateway` the expert source text is
+> sent to the gateway provider). Keep that class of data in `hermes`
 > (`/recall` + `/write`), which supports targeted deletion and redaction.
 
 ---
@@ -363,4 +416,5 @@ model and all other experts untouched.
 | `EXPERT_NOT_FOUND` | hermes-dmoe | No expert with that `id` | no |
 | `BANK_OOM` | hermes-dmoe | Expert bank exceeded GPU/host memory | no — evict or shard |
 | `ROUTER_EMPTY` | hermes-dmoe | BM25 index has no experts to select | no — upsert experts first |
-| `BASE_MODEL_UNAVAILABLE` | hermes-dmoe | Self-hosted base model not loaded | no — degrade to `hermes` RAG |
+| `BASE_MODEL_UNAVAILABLE` | hermes-dmoe (`local`) | Self-hosted base model not loaded | no — degrade to `hermes` RAG |
+| `GATEWAY_UNAVAILABLE` | hermes-dmoe (`gateway`) | AI Gateway call failed / no key | yes — then degrade to `hermes` RAG |

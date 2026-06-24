@@ -63,7 +63,7 @@ responsibility per layer**:
 | **Brain** | `claude-gateway` | Decisions, plans, synthesis | Side effects, I/O | VM-1 (Docker) |
 | **Hands** | `openclaw` | Tool execution, I/O, automation | Strategy, judgement | VM-2 (native systemd) |
 | **Memory** | `hermes` | Recall, learn, distil SOPs | Initiate actions | VM-3 (native systemd) |
-| **Knowledge** | `hermes-dmoe` *(optional)* | Parametric domain knowledge baked into model weights (DMoE) | Episodic recall, side effects | VM-3 (native, GPU) |
+| **Knowledge** | `hermes-dmoe` *(optional)* | Domain knowledge via DMoE — weight-level (GPU) **or** gateway prompt-level (no GPU) | Episodic recall, side effects | VM-3 (native; GPU for Mode A) |
 | **Bus** | `redis` | Job state, locks, cache | Long-term storage | VM-1 (Docker) |
 | **Storage** | `postgres + pgvector` | Episodic + SOP memory | Real-time state | VM-3 (native) |
 | **Orchestrator** | `n8n` | Sequencing, retries, fan-out | Anything an agent should do | VM-1 (Docker) |
@@ -72,16 +72,18 @@ responsibility per layer**:
 Each layer exposes a small typed API and can be upgraded, scaled, or replaced
 independently — whether it runs as a container or a native service.
 
-> **Optional Knowledge layer — `hermes-dmoe`.** Beyond `hermes` (which does
-> *prompt-level* RAG — facts are retrieved and stuffed into the context), an
-> optional sibling injects domain knowledge **into the model weights** at
-> decode time via **Decoupled Mixture-of-Experts (DMoE)**
-> ([arXiv:2606.14243](https://arxiv.org/abs/2606.14243)). It self-hosts a small
-> open-weight base model (Llama-3.2-1B / Qwen2.5-1.5B) plus a bank of
-> per-knowledge-unit LoRA experts, and is **not** on the default critical path —
-> Brain/Hands/Memory work without it. It cannot apply to the Claude Brain
-> (closed API, no weight access). See the [DMoE diagram](#7-dmoe-diagram-parametric-knowledge-injection)
-> and [`docs/references/README.md`](docs/references/README.md).
+> **Optional Knowledge layer — `hermes-dmoe`.** An optional sibling to `hermes`
+> that adds domain knowledge via **Decoupled Mixture-of-Experts (DMoE)**
+> ([arXiv:2606.14243](https://arxiv.org/abs/2606.14243)). It runs in **two modes**
+> sharing one expert bank + BM25 router: **Mode A (`local`)** self-hosts a small
+> open base model and merges LoRA experts **into the weights** (true parametric
+> DMoE, **needs a GPU**); **Mode B (`gateway`)** skips the GPU and instead feeds
+> the router-selected expert text to a model behind the **Vercel AI Gateway**
+> (prompt-level, **no GPU**). It is **not** on the default critical path —
+> Brain/Hands/Memory work without it — and true parametric injection never
+> applies to the closed-API Claude Brain. See the
+> [DMoE diagram](#7-dmoe-diagram-parametric-knowledge-injection) and
+> [`docs/references/README.md`](docs/references/README.md).
 
 ---
 
@@ -133,7 +135,7 @@ flowchart TB
         B["🧠 Brain<br/><b>claude-gateway</b><br/>VM-1 · Docker<br/>plan · merge · synthesize"]
         H["✋ Hands<br/><b>openclaw</b><br/>VM-2 · native<br/>execute · tools"]
         M["📚 Memory<br/><b>hermes</b><br/>VM-3 · native<br/>recall · write"]
-        K["🧬 Knowledge<br/><b>hermes-dmoe</b> (optional)<br/>VM-3 · native · GPU<br/>inject · experts"]
+        K["🧬 Knowledge<br/><b>hermes-dmoe</b> (optional)<br/>VM-3 · GPU or Gateway<br/>inject · experts"]
         FA["… future agents<br/>Validator · Critic · Router"]
     end
 
@@ -480,16 +482,48 @@ flowchart TD
 ## 7. DMoE diagram (parametric knowledge injection)
 
 *Optional Knowledge layer.* Where `hermes` retrieves facts **into the prompt**,
-`hermes-dmoe` injects domain knowledge **into the model weights** at decode
-time, using **Decoupled Mixture-of-Experts**
-([arXiv:2606.14243](https://arxiv.org/abs/2606.14243)). The base model is
-**frozen**; both the LoRA experts and the router are decoupled from it. Injection
-fires **only when the model is uncertain**, gated by token-entropy
-`TU_t = -Σ p_t(v) log p_t(v) > τ` (paper default `τ = 2.0`).
+`hermes-dmoe` adds domain knowledge using the **Decoupled Mixture-of-Experts**
+recipe ([arXiv:2606.14243](https://arxiv.org/abs/2606.14243)): a **training-free
+BM25 router** over a bank of per-knowledge-unit experts, fired **only when the
+model is uncertain** (token-entropy `TU_t = -Σ p_t(v) log p_t(v) > τ`,
+default `τ = 2.0`).
+
+`hermes-dmoe` ships in **two runtime modes** that share the same expert bank,
+the same BM25 router, and the same `POST /inject` API contract — only the
+*injection mechanism* differs. Pick one at setup time with the `DMOE_MODE`
+env var.
+
+### Which mode? (pick at setup)
+
+```mermaid
+flowchart TD
+    Q0(["Need domain-knowledge injection?"]) --> Q1{"GPU available on VM-3?"}
+    Q1 -- "Yes" --> Q2{"Need true parametric<br/>weight-level injection<br/>+ full data isolation?"}
+    Q1 -- "No" --> B["Mode B — Gateway<br/>DMOE_MODE=gateway"]
+    Q2 -- "Yes" --> A["Mode A — Self-hosted<br/>DMOE_MODE=local"]
+    Q2 -- "No / not yet" --> B
+
+    A --> AN["Real DMoE: merge LoRA Δθ<br/>into frozen base FFN.<br/>Requires GPU."]
+    B --> BN["Router-only DMoE: inject expert<br/>source text into the gateway prompt.<br/>No GPU. Uses AI Gateway model."]
+
+    classDef qa   fill:#F3F4F6,stroke:#6B7280,color:#1F2937;
+    classDef a    fill:#FCE7F3,stroke:#DB2777,color:#1F2937;
+    classDef b    fill:#FEF3C7,stroke:#F59E0B,color:#1F2937;
+    class Q0,Q1,Q2 qa
+    class A,AN a
+    class B,BN b
+```
+
+### Mode A — self-hosted (true parametric DMoE, needs GPU)
+
+The paper's method exactly: a **frozen** small open base model (Llama-3.2-1B /
+Qwen2.5-1.5B) on VM-3, with the BM25 router merging the selected LoRA deltas
+into the final-layer FFN **inside the decode loop**. Requires reading per-token
+logits and mutating weights — hence a **GPU and self-hosting are mandatory**.
 
 ```mermaid
 flowchart TB
-    IN(["Prompt + generation context"]) --> DEC["Frozen base model<br/>autoregressive decode"]
+    IN(["POST /inject (mode=local)"]) --> DEC["Frozen base model<br/>autoregressive decode"]
     DEC --> TU{"Token uncertainty<br/>TU = -Σ p log p<br/>TU &gt; τ ?"}
     TU -- "No (confident)" --> EMIT["Emit token<br/>(no experts)"]
     TU -- "Yes (uncertain)" --> Q["Build routing query q_t<br/>(prefix excl. trigger token)"]
@@ -523,17 +557,70 @@ flowchart TB
 ```
 
 **Why this shape.** Each knowledge unit is one small LoRA adapter (rank 4,
-α = 16, ~481 KiB) trained on a frozen base and attached **only to the final-layer
-FFN** — so the KV-cache is preserved and adapters compose additively. The router
-is a **training-free BM25** index over each expert's text surrogate `D_i`, so new
-knowledge is added by training one adapter + an incremental index update — no
-base-model retraining, no full re-index. Because injection is entropy-gated,
+α = 16, ~481 KiB) attached **only to the final-layer FFN** — so the KV-cache is
+preserved and adapters compose additively. Because injection is entropy-gated,
 most tokens decode at full base-model speed; the paper reports ~3× faster and
 ~1.6–1.9× less GPU than token-level RAG baselines like FLARE.
 
-> **Boundary.** DMoE applies to the **self-hosted** small base model only — not
-> the Claude Brain (closed API, no weights). And **PHI / regulated data stays in
-> `hermes`** (retrievable and redactable); it is never baked into a LoRA expert,
+### Mode B — gateway (router-only, no GPU)
+
+When VM-3 has **no GPU**, reuse the *same* expert bank and BM25 router but swap
+the injection mechanism: instead of merging weights, retrieve the Top-k experts'
+**source text `D_i`** and pass it as **prompt context** to a model behind the
+**Vercel AI Gateway** (the same HK-reachable provider the Brain uses). This is
+**not** true weight-level DMoE — it is router-driven, expert-scoped
+retrieval-augmentation — but it needs **no GPU and no self-hosted model**, and
+keeps the identical `/inject` contract and expert lifecycle.
+
+```mermaid
+flowchart TB
+    IN(["POST /inject (mode=gateway)"]) --> Q["Build routing query<br/>from the prompt"]
+    Q --> BM25["BM25 over expert<br/>text surrogates D_i"]
+    BM25 --> SEL["Select Top-k experts<br/>(k = 3)"]
+    SEL --> CTX["Assemble expert source text<br/>into a context block"]
+    CTX --> VG["☁️ Vercel AI Gateway<br/>chat completion (Opus / small model)"]
+    VG --> OUT(["Answer + experts_used[]"])
+
+    subgraph Bank["Expert bank (surrogate D_i + source text)"]
+        direction LR
+        E1["D₁ text"]
+        E2["D₂ text"]
+        E3["Dₙ text"]
+    end
+    BM25 -.reads surrogates.-> Bank
+    Bank -.supplies source text.-> CTX
+
+    classDef know  fill:#FCE7F3,stroke:#DB2777,color:#1F2937;
+    classDef ext   fill:#FEF3C7,stroke:#F59E0B,color:#1F2937;
+    classDef store fill:#D1FAE5,stroke:#10B981,color:#1F2937;
+    class Q,BM25,SEL,CTX know
+    class VG ext
+    class E1,E2,E3 store
+    class IN,OUT ext
+```
+
+### Mode comparison
+
+| | **Mode A — `local`** | **Mode B — `gateway`** |
+|---|---|---|
+| Injection level | **Parametric** (LoRA Δθ merged into weights) | **Prompt-level** (expert source text in context) |
+| True DMoE per the paper | Yes | Router-only approximation |
+| GPU on VM-3 | **Required** | **Not needed** |
+| Model | Self-hosted Llama-3.2-1B / Qwen2.5-1.5B | AI Gateway model (Claude Opus / small) |
+| Entropy trigger `TU > τ` | Per-token (real logits) | N/A (single gateway call) |
+| Data isolation | Knowledge stays on-VM in weights | Expert text sent to the gateway provider |
+| Ops weight | Heaviest (GPU box + LoRA training) | Lightest (CPU + API key) |
+| Best when | Air-gapped / on-prem, latency-sensitive, want the real method | No GPU, fast PoC, knowledge isn't provider-sensitive |
+
+**Shared across both modes.** Each knowledge unit is built once (1 paraphrase +
+3 generated Q&A pairs), indexed in BM25 by its surrogate `D_i`, and managed
+through the same `/experts/upsert` + `DELETE /experts/{id}` lifecycle. Switching
+mode is a single `DMOE_MODE` env flip — the expert bank is reused as-is.
+
+> **Boundary (both modes).** True parametric DMoE applies to the **self-hosted**
+> base model only — never the Claude Brain (closed API, no weights). And
+> **PHI / regulated data stays in `hermes`** (retrievable and redactable); it is
+> never baked into a LoRA expert (Mode A) nor sent to the gateway (Mode B),
 > where it could not be cleanly deleted.
 
 ---
@@ -579,20 +666,26 @@ deep dive. The **runtime** column reflects the 3-VM hybrid topology.
 - **Degradable:** if Postgres is down, `/recall` returns empty hits so the
   rest of the pipeline keeps running.
 
-### 🧬 `hermes-dmoe` (Knowledge, optional) — VM-3, native + GPU
+### 🧬 `hermes-dmoe` (Knowledge, optional) — VM-3, native
 
 - **Runtime:** Python 3.12 venv under `/opt/hermes-dmoe`, run by
-  `hermes-dmoe.service`; co-located with `hermes` on VM-3, needs a GPU.
+  `hermes-dmoe.service`, co-located with `hermes` on VM-3.
 - **Port:** 8004
 - **Endpoints:** `GET /health`, `GET /experts`, `POST /inject`,
   `POST /experts/upsert`, `DELETE /experts/{id}`
-- **Job:** parameter-level knowledge injection via **DMoE**. Self-hosts a small
-  open base model (Llama-3.2-1B / Qwen2.5-1.5B) and a bank of per-knowledge-unit
-  LoRA experts. At decode time, when token entropy `TU_t > τ` it routes via BM25
-  to the Top-k experts and merges their LoRA Δθ into the final-layer FFN.
+- **Two runtime modes (set `DMOE_MODE`):**
+  - **`local` — true parametric DMoE (needs GPU).** Self-hosts a small open base
+    model (Llama-3.2-1B / Qwen2.5-1.5B); when token entropy `TU_t > τ` it routes
+    via BM25 to the Top-k experts and **merges their LoRA Δθ into the final-layer
+    FFN**. This is the paper's method.
+  - **`gateway` — router-only (no GPU).** Reuses the same expert bank + BM25
+    router, but injects the selected experts' **source text as prompt context**
+    to a model behind the **Vercel AI Gateway**. No GPU, no self-hosted model;
+    same `/inject` contract. Approximation, not weight-level DMoE.
 - **Optional + degradable:** off the default critical path — if absent or down,
-  the pipeline runs on Brain/Hands/Memory alone. Does **not** apply to the
-  Claude Brain (closed API). Keep PHI/regulated data in `hermes`, not in experts.
+  the pipeline runs on Brain/Hands/Memory alone. True parametric injection does
+  **not** apply to the Claude Brain (closed API). Keep PHI/regulated data in
+  `hermes`, not in experts (and not sent to the gateway).
 - See [`docs/components.md`](docs/components.md#-hermes-dmoe--knowledge-dmoe) and
   [`docs/api-contract.md`](docs/api-contract.md#knowledge--hermes-dmoe-port-8004).
 
@@ -1132,7 +1225,7 @@ gateforge-loom/
     ├── claude-gateway/        # 🧠 Brain     → VM-1 (Docker)
     ├── openclaw/              # ✋ Hands     → VM-2 (native systemd)
     ├── hermes/                # 📚 Memory    → VM-3 (native systemd)
-    └── hermes-dmoe/           # 🧬 Knowledge → VM-3 (native, GPU; optional)
+    └── hermes-dmoe/           # 🧬 Knowledge → VM-3 (native; GPU for local mode; optional)
 ```
 
 ---

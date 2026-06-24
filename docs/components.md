@@ -203,41 +203,64 @@ CREATE TABLE sop (
 ## 🧩 hermes-dmoe — Knowledge (DMoE)
 
 ### What it is
-An **optional** sibling to `hermes` that injects knowledge at the **parameter
-level** instead of the prompt level, using **Decoupled Mixture-of-Experts**
+An **optional** sibling to `hermes` that injects domain knowledge, using
+**Decoupled Mixture-of-Experts**
 ([arXiv:2606.14243](https://arxiv.org/abs/2606.14243); local copy in
-[`references/DMoE-2606.14243v1.pdf`](references/DMoE-2606.14243v1.pdf)). It runs
-its own **self-hosted open base model** plus a bank of independently-trained
-LoRA experts, and answers knowledge-heavy sub-prompts that the closed-API Brain
-cannot be fine-tuned for.
+[`references/DMoE-2606.14243v1.pdf`](references/DMoE-2606.14243v1.pdf)). It owns
+one **expert bank** + a **training-free BM25 router**, and answers
+knowledge-heavy sub-prompts that the closed-API Brain cannot be fine-tuned for.
+
+It runs in **two runtime modes** (set with `DMOE_MODE`) that share the same
+expert bank, the same BM25 router, and the same `/inject` contract — only the
+*injection mechanism* differs:
+
+- **`local` — true parametric DMoE (needs GPU).** A **self-hosted frozen open
+  base model** merges the selected LoRA deltas into the final-layer FFN inside
+  the decode loop. This is the paper's method exactly. **Requires a GPU.**
+- **`gateway` — router-only (no GPU).** Reuses the same expert bank + BM25
+  router, but instead of merging weights it retrieves the Top-k experts' source
+  text and passes it as **prompt context** to a model behind the **Vercel AI
+  Gateway**. Not weight-level DMoE — router-driven, expert-scoped retrieval
+  augmentation — but it needs **no GPU and no self-hosted model**.
 
 | Property | Value |
 |---|---|
-| Base image | `nvidia/cuda:12.x` + Python 3.12 + FastAPI + vLLM/PEFT |
+| Runtime | Native systemd on **VM-3** (co-located with `hermes`) |
+| Base image (`local`) | `nvidia/cuda:12.x` + Python 3.12 + FastAPI + vLLM/PEFT |
+| Base image (`gateway`) | CPU-only Python 3.12 + FastAPI (no CUDA) |
 | Internal port | `8000` |
 | Default host port | `8004` |
 | Restart policy | `unless-stopped` |
-| Healthcheck | `GET /health` (includes base-model + index ping) |
-| Hardware | 1 GPU (paper runs Llama-3.2-1B / Qwen2.5-1.5B in ~7–8 GB) |
+| Healthcheck | `GET /health` (reports `mode`; pings base-model+index in `local`) |
+| Hardware | **`local`:** 1 GPU (~7–8 GB for Llama-3.2-1B / Qwen2.5-1.5B). **`gateway`:** CPU only |
 
 ### What it owns
-- A **frozen** self-hosted base model for autoregressive decoding
-- An **expert bank** of LoRA deltas `Δθ_i`, one per knowledge unit, each
-  ~123K params (~481 KiB on disk), attached **only to the final-layer FFN**
+- An **expert bank** of LoRA deltas `Δθ_i` + source text, one per knowledge
+  unit, each ~123K params (~481 KiB on disk), attached **only to the
+  final-layer FFN** (used as weights in `local`, as source text in `gateway`)
 - A **training-free BM25 router** over each expert's text surrogate `D_i`
-- **Uncertainty-gated** expert activation and hot LoRA merge during decoding
+  (identical in both modes)
+- **`local` only:** a **frozen** self-hosted base model, **uncertainty-gated**
+  expert activation, and hot LoRA merge during decoding
+- **`gateway` only:** an outbound client to the **Vercel AI Gateway** that sends
+  the routed expert text as prompt context
 
 ### What it must never do
 - Plan or pick tools (that's the Brain) — it only answers / completes prompts
-- Perform side-effecting I/O (no web, shell, or API calls)
-- Store regulated/PHI knowledge as baked experts (keep that in `hermes`)
+- Perform side-effecting I/O beyond the AI Gateway call in `gateway` mode
+  (no web, shell, or arbitrary API calls)
+- Store regulated/PHI knowledge as baked experts in `local`, **or** send it to
+  the gateway in `gateway` mode — keep that in `hermes` (retrievable/redactable)
 - Self-retry (n8n owns retry policy)
 
 ### Inference flow
 
+**Mode `local` — true parametric DMoE (GPU).** Per-token, entropy-gated LoRA
+merge inside the decode loop:
+
 ```mermaid
 flowchart TB
-    REQ(["POST /inject<br/>{ prompt }"]) --> DEC["Frozen base model<br/>decode step t"]
+    REQ(["POST /inject<br/>{ prompt, mode=local }"]) --> DEC["Frozen base model<br/>decode step t"]
     DEC --> TU{"TU_t = -Σ p log p<br/>TU_t &gt; τ ?"}
     TU -- no --> EMIT["emit token"]
     TU -- yes --> R["BM25 Top-k(q_t, D_i)<br/>k = 3"]
@@ -245,7 +268,7 @@ flowchart TB
     MG --> EMIT
     EMIT --> NX{"more tokens?"}
     NX -- yes --> DEC
-    NX -- no --> RES(["{ answer, experts_used[] }"])
+    NX -- no --> RES(["{ answer, experts_used[], mode }"])
 
     classDef base  fill:#FEE7DC,stroke:#D97757,color:#1F2937;
     classDef route fill:#FCE7F3,stroke:#DB2777,color:#1F2937;
@@ -255,6 +278,22 @@ flowchart TB
     class R,MG route
     class TU,NX gate
     class REQ,RES,EMIT io
+```
+
+**Mode `gateway` — router-only (no GPU).** One BM25 routing pass over the whole
+prompt, then a single AI-Gateway call with the expert text as context:
+
+```mermaid
+flowchart TB
+    GREQ(["POST /inject<br/>{ prompt, mode=gateway }"]) --> GR["BM25 Top-k(query, D_i)<br/>k = 3"]
+    GR --> GCTX["Assemble expert<br/>source text → context block"]
+    GCTX --> GVG["☁️ Vercel AI Gateway<br/>chat completion"]
+    GVG --> GRES(["{ answer, experts_used[], mode }"])
+
+    classDef route fill:#FCE7F3,stroke:#DB2777,color:#1F2937;
+    classDef ext   fill:#FEF3C7,stroke:#F59E0B,color:#1F2937;
+    class GR,GCTX route
+    class GVG,GREQ,GRES ext
 ```
 
 ### Endpoints
@@ -273,27 +312,36 @@ Full request/response shapes: [`api-contract.md`](api-contract.md#knowledge--her
 
 | Var | Required | Default | Notes |
 |---|---|---|---|
-| `STUB_MODE` | yes | `1` | `1` = echo + canned experts; `0` = real base model + LoRA merge |
-| `BASE_MODEL` | when `STUB_MODE=0` | `meta-llama/Llama-3.2-1B-Instruct` | Self-hosted open base |
-| `EXPERT_BANK_DIR` | yes | `/data/experts` | LoRA adapters + BM25 index volume |
-| `TU_THRESHOLD` | no | `2.0` | Token-entropy trigger `τ` |
-| `TOP_K` | no | `3` | Experts merged per trigger |
+| `DMOE_MODE` | yes | `local` | `local` = parametric DMoE (GPU); `gateway` = router-only via AI Gateway (no GPU) |
+| `STUB_MODE` | yes | `1` | `1` = echo + canned experts; `0` = real injection (per `DMOE_MODE`) |
+| `EXPERT_BANK_DIR` | yes | `/data/experts` | Expert bank (LoRA Δθ + source text + BM25 index) — **both modes** |
+| `TOP_K` | no | `3` | Experts routed per trigger — **both modes** |
+| `BASE_MODEL` | `local` + `STUB_MODE=0` | `meta-llama/Llama-3.2-1B-Instruct` | Self-hosted open base — **`local` only** |
+| `TU_THRESHOLD` | no | `2.0` | Token-entropy trigger `τ` — **`local` only** (gateway uses one call, no per-token gate) |
+| `AI_GATEWAY_BASE_URL` | `gateway` + `STUB_MODE=0` | `https://ai-gateway.vercel.sh/v1/anthropic` | Vercel AI Gateway endpoint — **`gateway` only** |
+| `AI_GATEWAY_API_KEY` | `gateway` + `STUB_MODE=0` | — | Gateway bearer key — **`gateway` only** |
+| `GATEWAY_MODEL` | `gateway` + `STUB_MODE=0` | `claude-opus-4` | Model name to call via the gateway — **`gateway` only** |
 | `INTERNAL_API_TOKEN` | no | — | Same auth scheme as other services |
 | `LOG_LEVEL` | no | `INFO` | |
 
 ### How to extend
-- **Build experts.** For each knowledge unit: 1 paraphrase + 3 generated Q&A
-  pairs → train a LoRA adapter (rank 4, α = 16, lr 1e-5, 1 epoch, base frozen),
-  store `Δθ_i` + surrogate `D_i`, insert `D_i` into the BM25 index.
-- **Swap the router.** BM25 is the default (training-free, robust). A dense
-  retriever (e.g. SGPT) can improve some datasets at ~0.6 GB more GPU.
-- **Tune the trade-off.** Raise `TU_THRESHOLD` to route less often (faster);
-  lower it for more aggressive injection.
+- **Pick a mode at setup.** Set `DMOE_MODE=local` if VM-3 has a GPU and you want
+  the real paper method with on-VM data isolation; set `DMOE_MODE=gateway` for a
+  no-GPU box that reuses the same expert bank but injects via the AI Gateway.
+  Switching is a single env flip — the expert bank is reused as-is.
+- **Build experts (both modes).** For each knowledge unit: 1 paraphrase + 3
+  generated Q&A pairs → train a LoRA adapter (rank 4, α = 16, lr 1e-5, 1 epoch,
+  base frozen), store `Δθ_i` + surrogate/source `D_i`, insert `D_i` into BM25.
+  `gateway` mode uses the stored source text; `local` mode merges the `Δθ_i`.
+- **Swap the router (both modes).** BM25 is the default (training-free, robust).
+  A dense retriever (e.g. SGPT) can improve some datasets at ~0.6 GB more GPU.
+- **Tune the trade-off (`local`).** Raise `TU_THRESHOLD` to route less often
+  (faster); lower it for more aggressive injection.
 - **Wire into the loom.** Add an n8n `IF` ("domain knowledge?") after
   `Hermes /recall` that routes knowledge-heavy jobs through `POST /inject`
   before `Claude /merge`. On the 3-VM hybrid topology `hermes-dmoe` is co-located
-  with `hermes` on **VM-3** (native systemd, GPU-equipped); point the n8n HTTP
-  node at VM-3's Tailscale IP on port `8004`.
+  with `hermes` on **VM-3** (native systemd; GPU only for `local`); point the
+  n8n HTTP node at VM-3's Tailscale IP on port `8004`.
 
 ---
 
