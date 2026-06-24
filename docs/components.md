@@ -200,6 +200,103 @@ CREATE TABLE sop (
 
 ---
 
+## 🧩 hermes-dmoe — Knowledge (DMoE)
+
+### What it is
+An **optional** sibling to `hermes` that injects knowledge at the **parameter
+level** instead of the prompt level, using **Decoupled Mixture-of-Experts**
+([arXiv:2606.14243](https://arxiv.org/abs/2606.14243); local copy in
+[`references/DMoE-2606.14243v1.pdf`](references/DMoE-2606.14243v1.pdf)). It runs
+its own **self-hosted open base model** plus a bank of independently-trained
+LoRA experts, and answers knowledge-heavy sub-prompts that the closed-API Brain
+cannot be fine-tuned for.
+
+| Property | Value |
+|---|---|
+| Base image | `nvidia/cuda:12.x` + Python 3.12 + FastAPI + vLLM/PEFT |
+| Internal port | `8000` |
+| Default host port | `8004` |
+| Restart policy | `unless-stopped` |
+| Healthcheck | `GET /health` (includes base-model + index ping) |
+| Hardware | 1 GPU (paper runs Llama-3.2-1B / Qwen2.5-1.5B in ~7–8 GB) |
+
+### What it owns
+- A **frozen** self-hosted base model for autoregressive decoding
+- An **expert bank** of LoRA deltas `Δθ_i`, one per knowledge unit, each
+  ~123K params (~481 KiB on disk), attached **only to the final-layer FFN**
+- A **training-free BM25 router** over each expert's text surrogate `D_i`
+- **Uncertainty-gated** expert activation and hot LoRA merge during decoding
+
+### What it must never do
+- Plan or pick tools (that's the Brain) — it only answers / completes prompts
+- Perform side-effecting I/O (no web, shell, or API calls)
+- Store regulated/PHI knowledge as baked experts (keep that in `hermes`)
+- Self-retry (n8n owns retry policy)
+
+### Inference flow
+
+```mermaid
+flowchart TB
+    REQ(["POST /inject<br/>{ prompt }"]) --> DEC["Frozen base model<br/>decode step t"]
+    DEC --> TU{"TU_t = -Σ p log p<br/>TU_t &gt; τ ?"}
+    TU -- no --> EMIT["emit token"]
+    TU -- yes --> R["BM25 Top-k(q_t, D_i)<br/>k = 3"]
+    R --> MG["θ_eff = θ + Σ Δθ_i<br/>(final-FFN merge)"]
+    MG --> EMIT
+    EMIT --> NX{"more tokens?"}
+    NX -- yes --> DEC
+    NX -- no --> RES(["{ answer, experts_used[] }"])
+
+    classDef base  fill:#FEE7DC,stroke:#D97757,color:#1F2937;
+    classDef route fill:#FCE7F3,stroke:#DB2777,color:#1F2937;
+    classDef gate  fill:#F3F4F6,stroke:#6B7280,color:#1F2937;
+    classDef io    fill:#FEF3C7,stroke:#F59E0B,color:#1F2937;
+    class DEC base
+    class R,MG route
+    class TU,NX gate
+    class REQ,RES,EMIT io
+```
+
+### Endpoints
+
+| Method | Path | Purpose |
+|---|---|---|
+| `GET` | `/health` | Liveness + base-model + expert-index status |
+| `GET` | `/experts` | Expert-bank stats (count, base model, index size) |
+| `POST` | `/inject` | Uncertainty-gated DMoE generation for a prompt |
+| `POST` | `/experts/upsert` | Add/update an expert (LoRA Δθ + surrogate `D_i`) |
+| `DELETE` | `/experts/{id}` | Remove one expert (drops index entry + adapter) |
+
+Full request/response shapes: [`api-contract.md`](api-contract.md#knowledge--hermes-dmoe-port-8004).
+
+### Environment
+
+| Var | Required | Default | Notes |
+|---|---|---|---|
+| `STUB_MODE` | yes | `1` | `1` = echo + canned experts; `0` = real base model + LoRA merge |
+| `BASE_MODEL` | when `STUB_MODE=0` | `meta-llama/Llama-3.2-1B-Instruct` | Self-hosted open base |
+| `EXPERT_BANK_DIR` | yes | `/data/experts` | LoRA adapters + BM25 index volume |
+| `TU_THRESHOLD` | no | `2.0` | Token-entropy trigger `τ` |
+| `TOP_K` | no | `3` | Experts merged per trigger |
+| `INTERNAL_API_TOKEN` | no | — | Same auth scheme as other services |
+| `LOG_LEVEL` | no | `INFO` | |
+
+### How to extend
+- **Build experts.** For each knowledge unit: 1 paraphrase + 3 generated Q&A
+  pairs → train a LoRA adapter (rank 4, α = 16, lr 1e-5, 1 epoch, base frozen),
+  store `Δθ_i` + surrogate `D_i`, insert `D_i` into the BM25 index.
+- **Swap the router.** BM25 is the default (training-free, robust). A dense
+  retriever (e.g. SGPT) can improve some datasets at ~0.6 GB more GPU.
+- **Tune the trade-off.** Raise `TU_THRESHOLD` to route less often (faster);
+  lower it for more aggressive injection.
+- **Wire into the loom.** Add an n8n `IF` ("domain knowledge?") after
+  `Hermes /recall` that routes knowledge-heavy jobs through `POST /inject`
+  before `Claude /merge`. On the 3-VM hybrid topology `hermes-dmoe` is co-located
+  with `hermes` on **VM-3** (native systemd, GPU-equipped); point the n8n HTTP
+  node at VM-3's Tailscale IP on port `8004`.
+
+---
+
 ## 🚌 redis — State Bus
 
 ### What it is
