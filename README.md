@@ -34,7 +34,6 @@ which keeps it reachable from regions where `api.anthropic.com` is blocked
 - [Workflow diagram](#4-workflow-diagram-the-n8n-pipeline)
 - [Deployment diagram](#5-deployment-diagram-3-vm-hybrid-topology)
 - [Install-flow diagram](#6-install-flow-diagram-cluster-bring-up)
-- [DMoE diagram](#7-dmoe-diagram-parametric-knowledge-injection)
 - [Components](#components)
 - [Quick start](#quick-start)
 - [Deployment topology](#deployment-topology)
@@ -63,7 +62,6 @@ responsibility per layer**:
 | **Brain** | `claude-gateway` | Decisions, plans, synthesis | Side effects, I/O | VM-1 (Docker) |
 | **Hands** | `openclaw` | Tool execution, I/O, automation | Strategy, judgement | VM-2 (native systemd) |
 | **Memory** | `hermes` | Recall, learn, distil SOPs | Initiate actions | VM-3 (native systemd) |
-| **Knowledge** | `hermes-dmoe` *(optional)* | Parametric domain knowledge baked into model weights (DMoE) | Episodic recall, side effects | VM-3 (native, GPU) |
 | **Bus** | `redis` | Job state, locks, cache | Long-term storage | VM-1 (Docker) |
 | **Storage** | `postgres + pgvector` | Episodic + SOP memory | Real-time state | VM-3 (native) |
 | **Orchestrator** | `n8n` | Sequencing, retries, fan-out | Anything an agent should do | VM-1 (Docker) |
@@ -71,17 +69,6 @@ responsibility per layer**:
 
 Each layer exposes a small typed API and can be upgraded, scaled, or replaced
 independently — whether it runs as a container or a native service.
-
-> **Optional Knowledge layer — `hermes-dmoe`.** Beyond `hermes` (which does
-> *prompt-level* RAG — facts are retrieved and stuffed into the context), an
-> optional sibling injects domain knowledge **into the model weights** at
-> decode time via **Decoupled Mixture-of-Experts (DMoE)**
-> ([arXiv:2606.14243](https://arxiv.org/abs/2606.14243)). It self-hosts a small
-> open-weight base model (Llama-3.2-1B / Qwen2.5-1.5B) plus a bank of
-> per-knowledge-unit LoRA experts, and is **not** on the default critical path —
-> Brain/Hands/Memory work without it. It cannot apply to the Claude Brain
-> (closed API, no weight access). See the [DMoE diagram](#7-dmoe-diagram-parametric-knowledge-injection)
-> and [`docs/references/README.md`](docs/references/README.md).
 
 ---
 
@@ -133,7 +120,6 @@ flowchart TB
         B["🧠 Brain<br/><b>claude-gateway</b><br/>VM-1 · Docker<br/>plan · merge · synthesize"]
         H["✋ Hands<br/><b>openclaw</b><br/>VM-2 · native<br/>execute · tools"]
         M["📚 Memory<br/><b>hermes</b><br/>VM-3 · native<br/>recall · write"]
-        K["🧬 Knowledge<br/><b>hermes-dmoe</b> (optional)<br/>VM-3 · native · GPU<br/>inject · experts"]
         FA["… future agents<br/>Validator · Critic · Router"]
     end
 
@@ -145,7 +131,6 @@ flowchart TB
         R[("Redis<br/>state bus · VM-1")]
         P[("Postgres + pgvector<br/>SOP + episodic · VM-3")]
         S[("Object store<br/>artifacts (S3 / MinIO)")]
-        X[("Expert bank<br/>LoRA Δθ + BM25 index · VM-3")]
     end
 
     subgraph Sinks["Output Sinks"]
@@ -156,29 +141,25 @@ flowchart TB
     N <--> B
     N <--> H
     N <--> M
-    N -.-> K
     N -.-> FA
     B <--> V
     B <--> R
     H <--> R
     H --> S
     M <--> P
-    K <--> X
     N --> O
 
     classDef brain   fill:#FEE7DC,stroke:#D97757,color:#1F2937;
     classDef hands   fill:#DBEAFE,stroke:#3B82F6,color:#1F2937;
     classDef memory  fill:#EDE9FE,stroke:#8B5CF6,color:#1F2937;
-    classDef know    fill:#FCE7F3,stroke:#DB2777,color:#1F2937,stroke-dasharray: 5 5;
     classDef future  fill:#F3F4F6,stroke:#9CA3AF,color:#1F2937,stroke-dasharray: 5 5;
     classDef store   fill:#D1FAE5,stroke:#10B981,color:#1F2937;
     classDef ext     fill:#FEF3C7,stroke:#F59E0B,color:#1F2937;
     class B brain
     class H hands
     class M memory
-    class K know
     class FA future
-    class R,P,S,X store
+    class R,P,S store
     class V ext
 ```
 
@@ -204,7 +185,6 @@ sequenceDiagram
     participant C as Claude Gateway (Brain)
     participant VG as Vercel AI Gateway
     participant M as Hermes (Memory)
-    participant K as Hermes-DMoE (Knowledge)
     participant O as OpenClaw (Hands)
     participant DB as Postgres / Redis
 
@@ -220,12 +200,6 @@ sequenceDiagram
     M->>DB: SELECT sop, episodic
     DB-->>M: hits[]
     M-->>N: memory_hits[]
-
-    opt domain-knowledge step (DMoE, optional)
-        N->>K: POST /inject { prompt }
-        K->>K: per token: if entropy TU_t > tau<br/>BM25 Top-k experts, merge LoRA Δθ
-        K-->>N: answer + experts_used[]
-    end
 
     N->>C: POST /merge { draft_plan, hits }
     C->>VG: messages.create (Claude Opus)
@@ -310,10 +284,7 @@ flowchart LR
     T(["🪝 Webhook Trigger"]) --> J["Generate job_id"]
     J --> P1["Claude /plan"]
     P1 --> R1["Hermes /recall"]
-    R1 --> KQ{"domain knowledge<br/>needed?"}
-    KQ -- "yes (optional)" --> DM["Hermes-DMoE /inject"]
-    KQ -- "no" --> M1
-    DM --> M1["Claude /merge"]
+    R1 --> M1["Claude /merge"]
     M1 --> SP["Split steps"]
     SP --> EX["OpenClaw /execute"]
     EX --> V{"Validate<br/>schema"}
@@ -328,7 +299,6 @@ flowchart LR
     classDef brain   fill:#FEE7DC,stroke:#D97757;
     classDef hands   fill:#DBEAFE,stroke:#3B82F6;
     classDef memory  fill:#EDE9FE,stroke:#8B5CF6;
-    classDef know    fill:#FCE7F3,stroke:#DB2777,stroke-dasharray: 5 5;
     classDef ctrl    fill:#F3F4F6,stroke:#6B7280;
     classDef out     fill:#FEF3C7,stroke:#F59E0B;
 
@@ -336,8 +306,7 @@ flowchart LR
     class P1,M1,SY brain
     class EX hands
     class R1,W memory
-    class DM know
-    class J,SP,V,AGG,KQ ctrl
+    class J,SP,V,AGG ctrl
     class OUT out
 ```
 
@@ -347,8 +316,6 @@ flowchart LR
 | 2 | **Generate job_id** | Code | Deterministic ID for tracing. |
 | 3 | **Claude /plan** | HTTP | Decompose intent → step list. |
 | 4 | **Hermes /recall** | HTTP | Pull relevant SOP + episodic memories. |
-| 4a | **domain knowledge?** | If/Switch | Optional branch — route to DMoE only when the job needs baked-in domain knowledge. |
-| 4b | **Hermes-DMoE /inject** *(optional)* | HTTP | Parametric knowledge injection (entropy trigger + BM25 Top-k LoRA experts). |
 | 5 | **Claude /merge** | HTTP | Fold memory into final plan (v2). |
 | 6 | **Split steps** | Split-Out | One iteration per plan step. |
 | 7 | **OpenClaw /execute** | HTTP | Run a single tool invocation. |
@@ -477,67 +444,6 @@ flowchart TD
 
 ---
 
-## 7. DMoE diagram (parametric knowledge injection)
-
-*Optional Knowledge layer.* Where `hermes` retrieves facts **into the prompt**,
-`hermes-dmoe` injects domain knowledge **into the model weights** at decode
-time, using **Decoupled Mixture-of-Experts**
-([arXiv:2606.14243](https://arxiv.org/abs/2606.14243)). The base model is
-**frozen**; both the LoRA experts and the router are decoupled from it. Injection
-fires **only when the model is uncertain**, gated by token-entropy
-`TU_t = -Σ p_t(v) log p_t(v) > τ` (paper default `τ = 2.0`).
-
-```mermaid
-flowchart TB
-    IN(["Prompt + generation context"]) --> DEC["Frozen base model<br/>autoregressive decode"]
-    DEC --> TU{"Token uncertainty<br/>TU = -Σ p log p<br/>TU &gt; τ ?"}
-    TU -- "No (confident)" --> EMIT["Emit token<br/>(no experts)"]
-    TU -- "Yes (uncertain)" --> Q["Build routing query q_t<br/>(prefix excl. trigger token)"]
-    Q --> BM25["BM25 over expert<br/>text surrogates D_i"]
-    BM25 --> SEL["Select Top-k experts<br/>(k = 3)"]
-    SEL --> MERGE["Compose effective params<br/>θ_eff = θ + Σ Δθ_i<br/>(final-layer FFN only)"]
-    MERGE --> DEC
-    EMIT --> MORE{"More tokens?"}
-    MORE -- "Yes" --> DEC
-    MORE -- "No" --> OUT(["Answer + experts_used[]"])
-
-    subgraph Bank["LoRA expert bank (decoupled, frozen base)"]
-        direction LR
-        E1["Δθ₁ LoRA<br/>+ D₁"]
-        E2["Δθ₂ LoRA<br/>+ D₂"]
-        E3["Δθₙ LoRA<br/>+ Dₙ"]
-    end
-    BM25 -.reads surrogates.-> Bank
-    Bank -.supplies Δθ.-> MERGE
-
-    classDef base    fill:#FEE7DC,stroke:#D97757,color:#1F2937;
-    classDef gate    fill:#FECACA,stroke:#DC2626,color:#1F2937;
-    classDef know    fill:#FCE7F3,stroke:#DB2777,color:#1F2937;
-    classDef store   fill:#D1FAE5,stroke:#10B981,color:#1F2937;
-    classDef out     fill:#FEF3C7,stroke:#F59E0B,color:#1F2937;
-    class DEC,EMIT base
-    class TU,MORE gate
-    class Q,BM25,SEL,MERGE know
-    class E1,E2,E3 store
-    class IN,OUT out
-```
-
-**Why this shape.** Each knowledge unit is one small LoRA adapter (rank 4,
-α = 16, ~481 KiB) trained on a frozen base and attached **only to the final-layer
-FFN** — so the KV-cache is preserved and adapters compose additively. The router
-is a **training-free BM25** index over each expert's text surrogate `D_i`, so new
-knowledge is added by training one adapter + an incremental index update — no
-base-model retraining, no full re-index. Because injection is entropy-gated,
-most tokens decode at full base-model speed; the paper reports ~3× faster and
-~1.6–1.9× less GPU than token-level RAG baselines like FLARE.
-
-> **Boundary.** DMoE applies to the **self-hosted** small base model only — not
-> the Claude Brain (closed API, no weights). And **PHI / regulated data stays in
-> `hermes`** (retrievable and redactable); it is never baked into a LoRA expert,
-> where it could not be cleanly deleted.
-
----
-
 ## Components
 
 Quick summary below; read [`docs/components.md`](docs/components.md) for the
@@ -578,23 +484,6 @@ deep dive. The **runtime** column reflects the 3-VM hybrid topology.
   + bump SOP versions on `/write`. Uses Postgres `vector(1536)` columns.
 - **Degradable:** if Postgres is down, `/recall` returns empty hits so the
   rest of the pipeline keeps running.
-
-### 🧬 `hermes-dmoe` (Knowledge, optional) — VM-3, native + GPU
-
-- **Runtime:** Python 3.12 venv under `/opt/hermes-dmoe`, run by
-  `hermes-dmoe.service`; co-located with `hermes` on VM-3, needs a GPU.
-- **Port:** 8004
-- **Endpoints:** `GET /health`, `GET /experts`, `POST /inject`,
-  `POST /experts/upsert`, `DELETE /experts/{id}`
-- **Job:** parameter-level knowledge injection via **DMoE**. Self-hosts a small
-  open base model (Llama-3.2-1B / Qwen2.5-1.5B) and a bank of per-knowledge-unit
-  LoRA experts. At decode time, when token entropy `TU_t > τ` it routes via BM25
-  to the Top-k experts and merges their LoRA Δθ into the final-layer FFN.
-- **Optional + degradable:** off the default critical path — if absent or down,
-  the pipeline runs on Brain/Hands/Memory alone. Does **not** apply to the
-  Claude Brain (closed API). Keep PHI/regulated data in `hermes`, not in experts.
-- See [`docs/components.md`](docs/components.md#-hermes-dmoe--knowledge-dmoe) and
-  [`docs/api-contract.md`](docs/api-contract.md#knowledge--hermes-dmoe-port-8004).
 
 ### 🚌 `redis` (State bus) — VM-1, Docker
 
@@ -1120,19 +1009,15 @@ gateforge-loom/
 │   ├── components.md          # per-component deep dive
 │   ├── api-contract.md        # endpoint reference
 │   ├── deployment.md          # VM bring-up, hardening, backups
-│   ├── architecture.md        # design decisions + extension points
-│   └── references/            # external reference docs (papers, specs)
-│       ├── README.md          # reference index
-│       └── DMoE-2606.14243v1.pdf
+│   └── architecture.md        # design decisions + extension points
 ├── infra/postgres/init.sql    # pgvector + tables + seed SOP (load on VM-3)
 ├── n8n/workflows/             # importable workflow JSON (VM-1)
 ├── schemas/                   # JSON Schemas for tool I/O
 ├── scripts/                   # health + smoke-test
 └── services/
-    ├── claude-gateway/        # 🧠 Brain     → VM-1 (Docker)
-    ├── openclaw/              # ✋ Hands     → VM-2 (native systemd)
-    ├── hermes/                # 📚 Memory    → VM-3 (native systemd)
-    └── hermes-dmoe/           # 🧬 Knowledge → VM-3 (native, GPU; optional)
+    ├── claude-gateway/        # 🧠 Brain   → VM-1 (Docker)
+    ├── openclaw/              # ✋ Hands   → VM-2 (native systemd)
+    └── hermes/                # 📚 Memory  → VM-3 (native systemd)
 ```
 
 ---
@@ -1144,7 +1029,6 @@ gateforge-loom/
 - [ ] Phase 2 — live Brain via **Vercel AI Gateway** (Claude Opus, Anthropic-compatible base URL)
 - [ ] Phase 3 — Playwright tool inside `openclaw`
 - [ ] Phase 4 — real embeddings in `hermes` (voyage-3 or text-embedding-3-small)
-- [ ] Phase 4.5 — `hermes-dmoe` parametric knowledge injection (DMoE: self-hosted small base model + LoRA expert bank + BM25 router + entropy trigger). See [`docs/references/README.md`](docs/references/README.md)
 - [ ] Phase 5 — Validator + Critic agents
 - [ ] Phase 6 — multi-tenant (`tenant_id` everywhere) + per-job cost guardrails
 - [ ] Phase 7 — Helm chart for OpenShift / Kubernetes deployment
